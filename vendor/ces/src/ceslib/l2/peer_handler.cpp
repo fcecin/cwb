@@ -139,8 +139,7 @@ void PeerHandler::teardownLink(std::shared_ptr<PeerLink> link) {
   link->closed = true;
   for (PeerChannel* ch : {&link->ctrl, &link->bulk}) {
     if (ch->dialTimer) {
-      boost::system::error_code ec;
-      ch->dialTimer->cancel(ec);
+      ch->dialTimer->cancel();
       ch->dialTimer.reset();
     }
     if (ch->stream) {
@@ -163,8 +162,7 @@ void PeerHandler::closeChannel(std::shared_ptr<PeerLink> link, bool bulk) {
   if (!link || link->closed) return;
   PeerChannel& ch = bulk ? link->bulk : link->ctrl;
   if (ch.dialTimer) {
-    boost::system::error_code ec;
-    ch.dialTimer->cancel(ec);
+    ch.dialTimer->cancel();
     ch.dialTimer.reset();
   }
   if (ch.stream) {
