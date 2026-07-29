@@ -1,0 +1,10 @@
+#!/bin/bash
+# Open a cwb browser window and return to the shell. No singleton, no tray --
+# each call opens another window, like a real browser. Optionally pass a URL:
+#   ./browse                     start page
+#   ./browse file://host/s/      a stored page (port defaults to 53831)
+#   ./browse lua://1@host/       a running instance, relayed
+DIR="$(dirname "$(readlink -f "$0")")"
+nohup "$DIR/run" cwb "$@" >/dev/null 2>&1 &
+disown
+echo "cwb window started (pid $!)"

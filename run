@@ -1,0 +1,21 @@
+#!/bin/bash
+# Find and run a binary from the cwb build tree. Resolves relative to this
+# script (works from any cwd). Searches the single-config cwb build, the fetched
+# ces build (ces / cesh), and per-config subdirs.
+BUILD="$(dirname "$(readlink -f "$0")")/build"
+SEARCH=(
+  "$BUILD"
+  "$BUILD/_deps/ces-build"
+  "$BUILD/debug" "$BUILD/release" "$BUILD/relwithdebinfo" "$BUILD/minsizerel"
+)
+if [ -z "$1" ]; then
+  echo "run: finds and runs a binary under $BUILD (and _deps/ces-build)" >&2
+  echo "Usage: $0 <binary> [args...]" >&2
+  exit 1
+fi
+BIN="$1"; shift
+for d in "${SEARCH[@]}"; do
+  if [ -x "$d/$BIN" ]; then exec "$d/$BIN" "$@"; fi
+done
+echo "ERROR: run: could not find '$BIN' under $BUILD" >&2
+exit 1

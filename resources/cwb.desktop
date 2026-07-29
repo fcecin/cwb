@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=cwb
+GenericName=CES Web Browser
+Comment=Browse and interact with CES servers
+Exec=cwb %u
+Icon=cwb
+Terminal=false
+Categories=Network;WebBrowser;
+StartupWMClass=cwb
