@@ -457,7 +457,7 @@ private:
     if (finished_) return;
     finished_ = true;
     boost::system::error_code ec;
-    timeoutTimer_.cancel(ec);
+    timeoutTimer_.cancel();
     if (stream_) stream_->close();
     if (cb_) {
       cb_(rc, std::move(body));
@@ -1663,19 +1663,19 @@ void CesServer::stop(bool flushEvents) {
   LOGDEBUG << "stop stopping task timers";
   if (metricsTimer_) {
     boost::system::error_code ec;
-    metricsTimer_->cancel(ec);
+    metricsTimer_->cancel();
   }
   if (dailyTimer_) {
     boost::system::error_code ec;
-    dailyTimer_->cancel(ec);
+    dailyTimer_->cancel();
   }
   if (replyTimer_) {
     boost::system::error_code ec;
-    replyTimer_->cancel(ec);
+    replyTimer_->cancel();
   }
   if (cronTimer_) {
     boost::system::error_code ec;
-    cronTimer_->cancel(ec);
+    cronTimer_->cancel();
   }
   LOGDEBUG << "stop stopping IO contexts";
   netIO_.stop();
@@ -1719,7 +1719,7 @@ void CesServer::stop(bool flushEvents) {
     LOGDEBUG << "rpc: closing dedicated MINX socket";
     if (rpcTickTimer_) {
       boost::system::error_code ec;
-      rpcTickTimer_->cancel(ec);
+      rpcTickTimer_->cancel();
     }
     rpcMinx_->closeSocket(false);
     rpcNetIO_.stop();
@@ -5474,7 +5474,7 @@ void CesServer::dailyTaskStartTimer() {
     secondsToWait = targetSeconds - secondsIntoDay;
   else
     secondsToWait = (SECS_PER_DAY - secondsIntoDay) + targetSeconds;
-  dailyTimer_->expires_from_now(std::chrono::seconds(secondsToWait));
+  dailyTimer_->expires_after(std::chrono::seconds(secondsToWait));
   dailyTimer_->async_wait(
     [this](const boost::system::error_code& ec) { dailyTaskTick(ec); });
 }

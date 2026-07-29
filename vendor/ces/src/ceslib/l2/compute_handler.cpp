@@ -3582,7 +3582,7 @@ void ComputeHandler::stop() {
   tickRunning_.store(false);
   if (tickTimer_) {
     boost::system::error_code ec;
-    tickTimer_->cancel(ec);
+    tickTimer_->cancel();
   }
   // Kill all instances. Iterate over a snapshot since killByPid erases.
   std::vector<uint64_t> ids;

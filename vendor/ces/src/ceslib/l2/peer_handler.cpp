@@ -190,7 +190,7 @@ void PeerHandler::establishChannel(std::shared_ptr<PeerLink> link, bool bulk) {
   ch.dialing = false;
   if (ch.dialTimer) {
     boost::system::error_code ec;
-    ch.dialTimer->cancel(ec);
+    ch.dialTimer->cancel();
     ch.dialTimer.reset();
   }
   if (ch.stream) ch.stream->setPersistent();
@@ -461,7 +461,7 @@ void PeerHandler::stop() {
   running_.store(false);
   if (reconcileTimer_) {
     boost::system::error_code ec;
-    reconcileTimer_->cancel(ec);
+    reconcileTimer_->cancel();
     reconcileTimer_.reset();
   }
   for (auto& [k, link] : links_) {
@@ -469,7 +469,7 @@ void PeerHandler::stop() {
     for (PeerChannel* ch : {&link->ctrl, &link->bulk}) {
       if (ch->dialTimer) {
         boost::system::error_code ec;
-        ch->dialTimer->cancel(ec);
+        ch->dialTimer->cancel();
       }
       if (ch->stream) {
         ch->stream->shutdown(kRudpStreamCloseTimeout);
