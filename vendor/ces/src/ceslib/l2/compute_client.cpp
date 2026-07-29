@@ -1,0 +1,279 @@
+// compute_client.cpp - CesComputeClient.
+//
+// A thin verb layer over a CesPlexChannel (see cesplex/session.h) — the
+// shared CesPlex client protocol. Each method is just the verb's preamble
+// building + response parsing; the channel drives the wire on whatever
+// transport it was handed (connect() = owned socket, attach() = external).
+
+#include <ces/l2/compute_client.h>
+#include <ces/cesplex/session.h>
+#include <ces/buffer.h>
+#include <ces/ramfilestore.h> // ces::sha256
+#include <ces/types.h>
+
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <vector>
+
+namespace ces {
+
+namespace {
+
+constexpr uint8_t kVerbLaunch    = 0x01;
+constexpr uint8_t kVerbKill      = 0x02;
+constexpr uint8_t kVerbList      = 0x03;
+constexpr uint8_t kVerbStat      = 0x04;
+constexpr uint8_t kVerbInstances = 0x05;
+constexpr uint8_t kVerbCall      = 0x06;
+
+constexpr const char* kComputeProto = "/ces/compute/1";
+
+// Parse a STAT response preamble: after the 72-byte fixed header
+// (id | started_at | file_balance | cpu_bp | rss_bytes | client_port |
+// rpc_port | program_pubkey) comes u16 name_len + name. Pulls the variable
+// tail off the channel.
+uint8_t statVariableReader(CesPlexChannel& chan,
+                           CesComputeClient::InstanceInfo& out,
+                           ces::Bytes& preamble) {
+  ces::Bytes lenBuf;
+  if (!chan.readExact(lenBuf, 2)) return CES_ERROR_INTERNAL;
+  preamble.insert(preamble.end(), lenBuf.begin(), lenBuf.end());
+  uint16_t nameLen = ces::Buffer::peek<uint16_t>(lenBuf.data());
+  ces::Bytes nameBuf;
+  if (nameLen > 0) {
+    if (!chan.readExact(nameBuf, nameLen)) return CES_ERROR_INTERNAL;
+    preamble.insert(preamble.end(), nameBuf.begin(), nameBuf.end());
+  }
+  out.pid     = ces::Buffer::peek<uint64_t>(preamble.data());
+  out.startedAtUs    = ces::Buffer::peek<uint64_t>(preamble.data() + 8);
+  out.fileBalance    = ces::Buffer::peek<uint64_t>(preamble.data() + 16);
+  out.cpuBasisPoints = ces::Buffer::peek<uint32_t>(preamble.data() + 24);
+  out.rssBytes       = ces::Buffer::peek<uint64_t>(preamble.data() + 28);
+  out.clientPort     = ces::Buffer::peek<uint16_t>(preamble.data() + 36);
+  out.rpcPort        = ces::Buffer::peek<uint16_t>(preamble.data() + 38);
+  std::memcpy(out.programPubkey.data(), preamble.data() + 40, 32);
+  out.sourceName.assign(nameBuf.begin(), nameBuf.end());
+  return CES_OK;
+}
+
+} // namespace
+
+class CesComputeClient::Impl {
+public:
+  // See CesFileClient::Impl: `owned` drives connect(); in attach() mode
+  // `chan` points at a channel the caller owns. The verb codec rides `chan`.
+  CesPlexClient owned;
+  CesPlexChannel* chan = nullptr;
+};
+
+CesComputeClient::CesComputeClient() : impl_(std::make_unique<Impl>()) {}
+CesComputeClient::~CesComputeClient() = default;
+
+uint8_t CesComputeClient::connect(const std::string& host, uint16_t rpcPort,
+                                  const KeyPair& signerKey) {
+  uint8_t rc = impl_->owned.connect(host, rpcPort, kComputeProto, signerKey);
+  if (rc == CES_OK) impl_->chan = impl_->owned.channel();
+  return rc;
+}
+
+// Drive verbs over a channel the caller owns + has already select()ed.
+// Mutually exclusive with connect().
+void CesComputeClient::attach(CesPlexChannel& channel) {
+  impl_->chan = &channel;
+}
+
+void CesComputeClient::disconnect() {
+  impl_->owned.disconnect();
+  impl_->chan = nullptr;
+}
+
+void CesComputeClient::setServerPubkey(const minx::Hash& pk) {
+  if (impl_->chan) impl_->chan->setServerPubkey(pk);
+  else impl_->owned.setServerPubkey(pk);
+}
+
+uint8_t CesComputeClient::launch(const std::string& name,
+                                 uint64_t& outInstanceId,
+                                 uint64_t& outStartedAtUs) {
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
+  pre.insert(pre.end(), name.begin(), name.end());
+  auto env = impl_->chan->buildEnvelope(kVerbLaunch, pre);
+
+  ces::Bytes resp;
+  uint8_t rc = impl_->chan->driveVerb(kVerbLaunch, env, /*fixedPre=*/16,
+                                     nullptr, resp);
+  if (rc != CES_OK) return rc;
+  outInstanceId  = ces::Buffer::peek<uint64_t>(resp.data());
+  outStartedAtUs = ces::Buffer::peek<uint64_t>(resp.data() + 8);
+  return CES_OK;
+}
+
+uint8_t CesComputeClient::kill(uint64_t pid) {
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  ces::Buffer::put<uint64_t>(pre, pid);
+  auto env = impl_->chan->buildEnvelope(kVerbKill, pre);
+
+  ces::Bytes resp;
+  return impl_->chan->driveVerb(kVerbKill, env, /*fixedPre=*/0, nullptr, resp);
+}
+
+uint8_t CesComputeClient::list(std::vector<InstanceInfo>& out) {
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  auto env = impl_->chan->buildEnvelope(kVerbList, pre);
+
+  out.clear();
+  // Variable preamble: read u32 count, then count × entries.
+  auto readVariable = [&](ces::Bytes& preamble) -> bool {
+    ces::Bytes countBuf;
+    if (!impl_->chan->readExact(countBuf, 4)) return false;
+    preamble.insert(preamble.end(), countBuf.begin(), countBuf.end());
+    uint32_t count = ces::Buffer::peek<uint32_t>(countBuf.data());
+    for (uint32_t i = 0; i < count; ++i) {
+      ces::Bytes header;
+      if (!impl_->chan->readExact(header, sizeof(uint64_t) + sizeof(uint16_t)))
+        return false;
+      preamble.insert(preamble.end(), header.begin(), header.end());
+      uint16_t nameLen = ces::Buffer::peek<uint16_t>(header.data() + 8);
+      ces::Bytes nameBuf;
+      if (nameLen > 0) {
+        if (!impl_->chan->readExact(nameBuf, nameLen)) return false;
+        preamble.insert(preamble.end(), nameBuf.begin(), nameBuf.end());
+      }
+      // Per-entry trailer: startedAtUs | fileBalance | cpuBp | rssBytes |
+      // client_port | rpc_port | program_pubkey.
+      ces::Bytes tail;
+      if (!impl_->chan->readExact(tail, sizeof(uint64_t) + sizeof(uint64_t)
+                                          + sizeof(uint32_t) + sizeof(uint64_t)
+                                          + sizeof(uint16_t) + sizeof(uint16_t)
+                                          + 32))
+        return false;
+      preamble.insert(preamble.end(), tail.begin(), tail.end());
+
+      InstanceInfo info;
+      info.pid     = ces::Buffer::peek<uint64_t>(header.data());
+      info.sourceName.assign(nameBuf.begin(), nameBuf.end());
+      info.startedAtUs    = ces::Buffer::peek<uint64_t>(tail.data());
+      info.fileBalance    = ces::Buffer::peek<uint64_t>(tail.data() + 8);
+      info.cpuBasisPoints = ces::Buffer::peek<uint32_t>(tail.data() + 16);
+      info.rssBytes       = ces::Buffer::peek<uint64_t>(tail.data() + 20);
+      info.clientPort     = ces::Buffer::peek<uint16_t>(tail.data() + 28);
+      info.rpcPort        = ces::Buffer::peek<uint16_t>(tail.data() + 30);
+      std::memcpy(info.programPubkey.data(), tail.data() + 32, 32);
+      out.push_back(std::move(info));
+    }
+    return true;
+  };
+
+  ces::Bytes resp;
+  uint8_t rc = impl_->chan->driveVerb(kVerbList, env, /*fixedPre=*/0,
+                                     readVariable, resp);
+  if (rc != CES_OK) out.clear();
+  return rc;
+}
+
+uint8_t CesComputeClient::stat(uint64_t pid, InstanceInfo& out) {
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  ces::Buffer::put<uint64_t>(pre, pid);
+  auto env = impl_->chan->buildEnvelope(kVerbStat, pre);
+
+  out = InstanceInfo{};
+  auto reader = [this, &out](ces::Bytes& preamble) -> bool {
+    return statVariableReader(*impl_->chan, out, preamble) == CES_OK;
+  };
+  ces::Bytes resp;
+  return impl_->chan->driveVerb(kVerbStat, env, /*fixedPre=*/72, reader, resp);
+}
+
+uint8_t CesComputeClient::instances(const std::string& path,
+                                    std::vector<InstanceInfo>& out) {
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(path.size()));
+  pre.insert(pre.end(), path.begin(), path.end());
+  auto env = impl_->chan->buildEnvelope(kVerbInstances, pre);
+
+  out.clear();
+  // Variable preamble: read u32 count, then count × fixed 64-byte entries:
+  // id | started_at | cpu_bp | rss_bytes | client_port | rpc_port |
+  // program_pubkey.
+  auto reader = [this, &out, path](ces::Bytes& preamble) -> bool {
+    ces::Bytes countBuf;
+    if (!impl_->chan->readExact(countBuf, 4)) return false;
+    preamble.insert(preamble.end(), countBuf.begin(), countBuf.end());
+    uint32_t count = ces::Buffer::peek<uint32_t>(countBuf.data());
+    // Don't pre-allocate on a server-declared count; a hostile value would OOM.
+    // The loop self-limits: readExact fails once the real entries run out.
+    out.reserve(count < 65536 ? count : 65536);
+    for (uint32_t i = 0; i < count; ++i) {
+      ces::Bytes e;
+      if (!impl_->chan->readExact(e, 64)) return false;
+      preamble.insert(preamble.end(), e.begin(), e.end());
+      InstanceInfo info;
+      info.pid     = ces::Buffer::peek<uint64_t>(e.data());
+      info.startedAtUs    = ces::Buffer::peek<uint64_t>(e.data() + 8);
+      info.cpuBasisPoints = ces::Buffer::peek<uint32_t>(e.data() + 16);
+      info.rssBytes       = ces::Buffer::peek<uint64_t>(e.data() + 20);
+      info.clientPort     = ces::Buffer::peek<uint16_t>(e.data() + 28);
+      info.rpcPort        = ces::Buffer::peek<uint16_t>(e.data() + 30);
+      std::memcpy(info.programPubkey.data(), e.data() + 32, 32);
+      info.sourceName     = path;  // the query key, echoed for convenience
+      out.push_back(std::move(info));
+    }
+    return true;
+  };
+  ces::Bytes resp;
+  uint8_t rc = impl_->chan->driveVerb(kVerbInstances, env, /*fixedPre=*/0,
+                                     reader, resp);
+  if (rc != CES_OK) out.clear();
+  return rc;
+}
+
+uint8_t CesComputeClient::call(uint64_t pid, uint64_t value,
+                               const ces::Bytes& memo, ces::Bytes& reply) {
+  if (memo.size() > CES_L2_CALL_MAX_MEMO) return CES_ERROR_BAD_INPUT;
+  // The memo rides as the request body (hash-committed in the preamble, like
+  // file WRITE), so it is not packet-bounded.
+  minx::Hash memoHash = ces::sha256(memo.data(), memo.size());
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  ces::Buffer::put<uint64_t>(pre, pid);
+  ces::Buffer::put<uint64_t>(pre, value);
+  ces::Buffer::put<uint32_t>(pre, static_cast<uint32_t>(memo.size()));
+  pre.insert(pre.end(), memoHash.begin(), memoHash.end());
+  auto env = impl_->chan->buildEnvelope(kVerbCall, pre);
+
+  reply.clear();
+  // Reply framing: [u32 len][32 sha256(reply)] fixed preamble + `len` reply
+  // bytes as the body. The body follows the response's signed tail, so it
+  // rides respBodyLen, not the preamble reader. The declared length is capped
+  // at CES_L2_CALL_MAX_REPLY so a hostile or buggy server can't make us
+  // allocate an unbounded response (the server truncates to the same cap).
+  constexpr size_t kCallRespPre = sizeof(uint32_t) + 32;
+  auto bodyLen = [](const ces::Bytes& preamble) -> uint64_t {
+    if (preamble.size() < kCallRespPre) return 0;
+    uint64_t declared = ces::Buffer::peek<uint32_t>(preamble.data());
+    return declared < CES_L2_CALL_MAX_REPLY ? declared : CES_L2_CALL_MAX_REPLY;
+  };
+  ces::Bytes outPre;
+  uint8_t rc = impl_->chan->driveVerb(kVerbCall, env, /*fixedPre=*/kCallRespPre,
+                                     /*readVariablePreamble=*/nullptr, bodyLen,
+                                     /*extraBodyToSend=*/memo, outPre, reply);
+  if (rc != CES_OK) { reply.clear(); return rc; }
+  // The response sig covers only the preamble; the digest in it is what
+  // authenticates the reply bytes.
+  minx::Hash gotHash = ces::sha256(reply.data(), reply.size());
+  if (outPre.size() < kCallRespPre ||
+      std::memcmp(gotHash.data(), outPre.data() + sizeof(uint32_t), 32) != 0) {
+    reply.clear();
+    return CES_ERROR_INTERNAL;
+  }
+  return CES_OK;
+}
+
+} // namespace ces

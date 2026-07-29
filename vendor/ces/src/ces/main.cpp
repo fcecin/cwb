@@ -1,0 +1,1356 @@
+/**
+ * ces - A Hashcash server built on MINX
+ *
+ * Supports TOML config file (--config file.toml) and CLI switches.
+ * CLI switches override config file values.
+ * --config without argument dumps default config to stdout and exits.
+ */
+
+#include <chrono>
+#include <filesystem>
+#include <thread>
+#include <unistd.h>
+
+#include <CLI/CLI.hpp>
+#include <toml++/toml.hpp>
+
+#include <ces/cesco.h>
+#include <ces/webadmin.h>
+#include <ces/util/ctrlc.h>
+#include <ces/util/log.h>
+#include <ces/util/helpers.h>
+#include <ces/server.h>
+
+#include <minx/blog.h>
+
+using namespace ces;
+
+static const std::string DEFAULT_DATA_DIR = "./data";
+static const std::string DEFAULT_PRIV_KEY_HEX_STR =
+  "3fdade772f129d5b43e36fab610c77db6a4a697e9d0899b24b4254f0968aa7b5";
+
+// Config default values are the DEFAULT_* / BASE_FEE_* constants in
+// <ces/server.h> (namespace ces) -- the single source the CesConfig struct,
+// the CLI option defaults below, and dumpDefaultConfig() all read. DATA_DIR
+// and the dump's sample key are main-only, so they stay here.
+
+void dumpKeyPair(const KeyPair& keyPair) {
+  std::cout << "Private Key: " << keyPair.getPrivateKeyHexStr() << std::endl;
+  std::cout << "Public Key:  " << keyPair.getPublicKeyHexStr() << std::endl;
+  exit(0);
+}
+
+// Dump default config to stdout.
+void dumpDefaultConfig() {
+  int defaultThreads =
+    static_cast<int>(std::thread::hardware_concurrency()) / 2 - 2;
+  if (defaultThreads < 1) defaultThreads = 1;
+
+  // Mint a fresh key for this dump so the emitted config is unique and
+  // runnable as-is, never a shared well-known one.
+  std::string freshServerKey = KeyPair().getPrivateKeyHexStr();
+
+  std::cout << R"(# CES Server Configuration
+#
+# Generated from the binary: this template lists every knob THIS build
+# understands, set to its default value. Dump it, edit, then run:
+#   ces --config > server.toml      # dump this template
+#   ces --config server.toml        # run with it
+# CLI flags override file values. -1 on a fee means "use the built-in default".
+#
+# CRUCIAL: the rpc-port L2 protocols (file / lua / compute / peer) are wired in
+# the [cesplex_mounts] table further down -- that map is what turns them on.
+# It's a TOML table, so it has to live below the top-level keys.
+
+# Log level: trace, debug, info, warning, error, fatal
+log_level = "info"
+
+# Data directory for account/asset persistence
+data_dir = ")" << DEFAULT_DATA_DIR << R"("
+
+# Server UDP port
+port = )" << DEFAULT_PORT << R"(
+
+# Server private key (32-byte hex). This value is freshly generated on every
+# `ces --config` dump, so this file is unique and ready to run as-is -- it is a
+# real, usable key, not a shared placeholder. Replace it only if you already
+# have one (e.g. from ces --genkeypair).
+server_key = ")" << freshServerKey << R"("
+
+# Minimum proof-of-work difficulty: the per-solution hash floor. Higher
+# mints scarcer credit and costs more CPU per solution.
+min_difficulty = )" << static_cast<int>(DEFAULT_MIN_DIFF) << R"(
+
+# Delay in seconds before accepting PoW after startup (0 = immediate). A
+# delay lets the RandomX dataset finish initializing before solutions count.
+pow_delay = )" << DEFAULT_POW_DELAY << R"(
+
+# Size of the PoW double-spend tracking slots in seconds
+spend_slot_size = )" << DEFAULT_SPEND_SLOT_SIZE << R"(
+
+# Don't create the RandomX verifier (no mining). true = a pure L2/file/
+# compute box that serves no signed main-port ops and accepts no mints
+# (instant boot, no RandomX RAM). Leave false for any node that mints.
+no_pow_engine = false
+
+# Use cache-only RandomX: ~256 MB instead of the full ~2.5 GB dataset, at
+# slower verification. true only when RAM is tight.
+cache_only_pow = false
+
+# Number of task processing threads (default = hardware_concurrency/2 - 2).
+threads = )" << defaultThreads << R"(
+
+# Account DB capacity (power of 2). min = reserved at boot, max = hard cap.
+# RAM is roughly 64 bytes/account plus hash-map load factor (2^24 = 16M
+# accounts ~ 1.2 GB).
+min_accounts = )" << DEFAULT_MIN_ACC << R"(
+max_accounts = )" << DEFAULT_MAX_ACC << R"(
+
+# Asset DB capacity (power of 2). RAM is ~256 bytes/asset plus load factor.
+min_assets = )" << DEFAULT_MIN_ASSET << R"(
+max_assets = )" << DEFAULT_MAX_ASSET << R"(
+
+# Alias DB capacity (power of 2). RAM is ~64 bytes/alias plus load factor.
+min_aliases = )" << DEFAULT_MIN_ALIAS << R"(
+max_aliases = )" << DEFAULT_MAX_ALIAS << R"(
+
+# Minimum value delta before flushing to OS buffers. 0 = flush every change
+# (max durability); a larger batch cuts write syscalls under load.
+flush_value = )" << DEFAULT_FLUSH_VALUE << R"(
+
+# Max events log (WAL) size in GB before an auto-snapshot compacts it
+# (0 = disable). Smaller compacts more often (faster restart-replay) at the
+# cost of more snapshot forks.
+max_log_size_gb = )" << DEFAULT_MAX_LOG_SIZE_GB << R"(
+
+# Fees (internal units). -1 = use the value compiled into this binary; the
+# inline comment shows what that built-in default currently is.
+fee_account = -1   # built-in: )" << ces::BASE_FEE_ACCOUNT << R"(
+fee_asset   = -1   # built-in: )" << ces::BASE_FEE_ASSET << R"(
+fee_tx      = -1   # built-in: )" << ces::BASE_FEE_TRANSACTION << R"(
+fee_query   = -1   # built-in: )" << ces::BASE_FEE_QUERY << R"(
+fee_vm_mult = -1   # built-in: )" << ces::BASE_FEE_VM_MULT << R"(
+
+# Server's public address (optional, for peer discovery)
+# If set, included in PoW submissions to peer servers.
+# server_name = "myserver.example.com:53830"
+
+# Peering: target credit balance to maintain on each peer server
+peer_target = )" << DEFAULT_PEER_TARGET << R"(
+
+# Inbound PoW reciprocation (basis points): outbound PoW we mine per unit of
+# inbound PoW a peer mines on us. 0 = off (never mine on inbound-only peers).
+# 10000 = 1:1, 20000 = 2x, 5000 = half. Outbound peers ignore this.
+peer_pow_inbound_reciprocation_bps = )" << DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS << R"(
+
+# Peer-table size: peers persisted to disk and exposed to ces.peers(). The number
+# held in RAM is 3x this (headroom so grief-banned tombstones do not crowd out live
+# peers). Small values bound each node's candidate view; raise for larger meshes.
+max_peers = )" << DEFAULT_MAX_PEERS << R"(
+
+# Async settlement max retries per operation (1 = no retries, for testing)
+settlement_max_retries = )" << CesClientAsync::DEFAULT_MAX_RETRIES << R"(
+
+# Max reserve (raw) one operation may spend at one peer. Caps each gossip
+# fan-out leg; the unallocated remainder reverts to the originator.
+# 0 = uncapped (only the reserve on hand bounds a leg).
+max_peer_reserve_disturbance = )" << DEFAULT_MAX_PEER_RESERVE_DISTURBANCE << R"(
+
+# Peers each gossip hop forwards to: a random subset of this size from the
+# reachable peers we hold reserve with. 0 = forward to every peer.
+gossip_fanout_degree = )" << DEFAULT_GOSSIP_FANOUT_DEGREE << R"(
+
+# Admin console (Unix domain socket). Empty or omitted = disabled.
+# admin_socket = "./admin.sock"
+
+# Web dashboard (HTTP). Loopback only, NO authentication — reach it by
+# SSH-tunneling to the host (e.g. ssh -L 8080:127.0.0.1:8080 host). The
+# operator's control panel: peering, minting, lookups, billing, live log
+# tail, and the server-info "hello" banner. 0 = disabled (default).
+# web_port = 0
+# web_bind = ")" << DEFAULT_WEB_BIND << R"("
+
+# Dedicated MINX/RUDP UDP port for CesPlex -- the gateway for the ENTIRE
+# L2 stack (file / lua / compute / peer mesh) plus the SYS_RPC syscall.
+# 0 = disabled: no second Minx, no L2 binds, no peer mesh, SYS_RPC returns
+# CES_ERROR_DISABLED. Nonzero binds a second Minx here; open or close it at
+# the firewall independently from the main port. When up, which protocols
+# are actually served is decided entirely by [cesplex_mounts] below -- nothing
+# auto-mounts.
+# The conventional CES rpc port is )" << DEFAULT_RPC_PORT << R"( (the main port + 1,
+# DEFAULT_RPC_PORT). Clients assume it when an address names no port (cwb's
+# file:// compute:// lua:// default here), so serve on it unless you have a
+# reason not to. Both ports sit in the IANA dynamic range (49152-65535,
+# RFC 6335), which is never assigned to protocols.
+rpc_port = 0
+
+# SYS_RPC outbound flow control (only relevant when rpc_port != 0).
+# - rpc_max_pending: cap on concurrent outbound calls; queueRpc returns
+#   CES_ERROR_QUEUE_FULL beyond this.
+# - rpc_max_request_bytes / rpc_max_response_bytes: size caps per call.
+# - rpc_response_timeout_ms: per-call asio timer firing CES_ERROR_TIMEOUT.
+# - rpc_rudp_bytes_per_second / rpc_rudp_burst_bytes: per-channel RUDP
+#   pacing advertised in the handshake. 4294967295 = unlimited.
+rpc_max_pending = )" << DEFAULT_RPC_MAX_PENDING << R"(
+rpc_max_request_bytes = )" << DEFAULT_RPC_MAX_REQUEST_BYTES << R"(
+rpc_max_response_bytes = )" << DEFAULT_RPC_MAX_RESPONSE_BYTES << R"(
+rpc_response_timeout_ms = )" << DEFAULT_RPC_RESPONSE_TIMEOUT_MS << R"(
+rpc_rudp_bytes_per_second = )" << DEFAULT_RPC_RUDP_BYTES_PER_SECOND << R"(
+rpc_rudp_burst_bytes = )" << DEFAULT_RPC_RUDP_BURST_BYTES << R"(
+
+# (The [rpc_rudp] sub-table for these transport caps is at the end, with the
+# other TOML tables -- all top-level keys must come before any [table] header.)
+
+# --- File-storage feature (CesPlex builtin:file) ---
+# File storage is integral to the system, so its knobs are active below (not
+# commented). They still read as defaults; editing them is the common case.
+#
+# Metered-storage cap (bytes) for the user zones /h/ /f/ /p/. This is NOT the
+# on/off switch -- the file handler is on iff /ces/file/1 is wired in
+# [cesplex_mounts]. 0 = no metered user storage (CREATE in those zones is
+# rejected); the unmetered /s/ zone (extensions, operator content) still works
+# whenever file is mounted. >0 = allow metered storage up to this many bytes.
+file_store_max_bytes = 0
+
+# Storage directory. Empty = "<data_dir>/cesfilestore".
+file_store_dir = ""
+
+# Read-only catalog of installable extensions (single .lua files). The
+# Extensions page lists these as available. Empty = no catalog.
+extensions_dir = ""
+
+# Extension funding budget: global rate (raw credit units/day, over all
+# extensions and remotes) the server grants /s/ programs that call
+# ces.request_funds. The discovery extension needs it. 0 = off.
+ext_funding_per_day = )" << DEFAULT_EXT_FUNDING_PER_DAY << R"(
+
+# Local extension budget: raw credit units each /s/ program account is topped
+# up to (per extension) on boot and at daily maintenance. 0 = off.
+ext_local_budget = )" << DEFAULT_EXT_LOCAL_BUDGET << R"(
+
+# File fees. -1 = derive at startup (the math is shown inline per knob).
+# CREATE has no per-byte cost; rent accrues from the file's file_balance.
+fee_file_rent  = -1   # when -1: fee_asset / 100 / 256  (retention, per byte-day)
+fee_file_write = -1   # when -1: fee_file_rent * 9       (write, per KB)
+fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
+
+# --- Compute feature (CesPlex builtin:compute) ---
+#
+# Mounted iff /ces/compute/1 is wired in [cesplex_mounts]. It also requires
+# builtin:file mounted (it uses the file handler for owner-authority file ops)
+# and compute_user to exist on the host; if a wired compute is missing those
+# it stays inert (logged at boot), it does not crash. compute_max_instances is
+# the admission cap: 0 = mounted but admits no instances; >0 caps child
+# processes (× mem cap = total RAM bound).
+# compute_max_instances    = 0
+#
+# L2 compute program UDP port range: [compute_port_base,
+# compute_port_base + compute_port_count - 1]. Each instance binds its
+# outbound CES client to a server-assigned port from this range — the
+# child never picks an ephemeral port (a firewalled L2 host opens only
+# known ports). Base and count are independent of compute_max_instances;
+# open exactly [base, base+count-1] at the firewall to match. base = 0 =
+# no range: instances run local-only and their outbound network verbs
+# fail with "networking disabled". An exhausted range is NOT a launch
+# failure — those instances just run local-only too.
+# compute_port_base        = 0
+# compute_port_count       = 0
+#
+# Per-process memory ceiling — RLIMIT_AS in the child (the kernel denies
+# allocations past it; OOM is an instant, machine-wide attack vector).
+# With compute_max_instances this bounds total compute memory. CPU is
+# billed, not capped; the sandbox forbids forking.
+# compute_process_mem_max  = )" << DEFAULT_COMPUTE_PROCESS_MEM_MAX << R"(   # bytes (RLIMIT_AS per process)
+#
+# Worker threads each Lua child uses for outbound ces.file_client /
+# ces.compute_client calls — how many such round-trips can be in flight before
+# more queue. The main-port client pool (ces.ping / ces.remote_*) is fixed at 1.
+# compute_client_pool_size = )" << DEFAULT_COMPUTE_CLIENT_POOL_SIZE << R"(            # clamped 1..64
+#
+# Fees — credits per unit time / per byte. -1 = use default.
+#   fee_compute_cpu_sec     — CPU time, per second (unused in stub phase)
+#   fee_compute_rss_byte_day — RSS, per byte per second (unused in stub phase)
+#   fee_compute_net_byte    — outbound APPLICATION bytes, per byte
+#   fee_compute_slot_sec    — nominal "occupy a slot" fee, per wall-second.
+#                             Only fee actually charged in the stub phase.
+#                             Default: rent on a 1 KB file per second
+#                             (derived from fee_file_rent).
+# fee_compute_cpu_sec      = -1   # when -1: 5000000 (flat)
+# fee_compute_rss_byte_day = -1   # when -1: fee_asset / 256
+# fee_compute_net_byte     = -1   # when -1: 0 (reserved, unused)
+# fee_compute_slot_sec     = -1   # when -1: fee_asset / 86400
+# fee_bucket_byte_sec      = -1   # when -1: fee_compute_rss_byte_day / 86400
+#
+# ChannelMeter (CesPlex net metering) rates. Throughput is metered per KiB so
+# the rate can sit below 1 raw/byte. 0 is a sentinel, not "free": the server
+# derives a non-zero default from the ledger anchors at startup, so metering
+# stays on. An explicit non-zero overrides (small = cheap, large = dear).
+# fee_net_kib_sent       = 0   # when 0: fee_file_rent / 2
+# fee_net_kib_received   = 0   # when 0: fee_net_kib_sent
+# fee_net_channel_sec    = 0   # when 0: fee_asset / 86400
+# fee_net_mem_byte_day   = 0   # when 0: fee_asset / 256
+#
+# Storage dir for per-instance scratch / IPC sockets.
+# compute_work_dir = ""   # default "<data_dir>/cescompute/"
+#
+# Unix user cesluad child processes drop to (must exist on host).
+# compute_user = ")" << DEFAULT_COMPUTE_USER << R"("
+#
+# Compute child binary path. Empty/unset (default) = auto-discover
+# `cesluajitd` next to ces's own binary (/proc/self/exe), then fall
+# back to bare-name PATH lookup. Set explicitly to use a specific
+# binary or pin a path that's not next to ces.
+# compute_child_binary = ""
+)"
+#ifdef CES_MAIL
+       << R"(#
+# Outbound mail relay (ces.mail.send). Empty relay host = mail is logged and
+# dropped. Credentials ride AUTH LOGIN; STARTTLS is used when the relay
+# advertises it. Secure this file if you set a password.
+# mail_relay_host = ""      # e.g. "localhost"
+# mail_relay_port = 587
+# mail_from       = ""      # e.g. "no-reply@your-domain.example"
+# mail_user       = ""      # SMTP AUTH user (empty = no AUTH)
+# mail_pass       = ""      # SMTP AUTH password (empty = no AUTH)
+# mail_fee_per_mb        = 0          # credits burned per MB of outgoing mail
+# mail_max_encoded_bytes = 20971520   # 20 MiB cap on one message
+)"
+#endif
+       << R"(
+# === CesPlex mounts: the crucial L2 wiring (rpc_port only). ===
+# CesPlex is implementation-agnostic. Each entry wires a protocol name to a
+# builtin handler impl, and this map is the ONLY thing that decides what the
+# rpc port serves -- nothing auto-mounts. A protocol absent here is not served
+# (a badly-wired or empty map just means those features are off). file + peer
+# are wired by default. Uncomment lua + compute to enable them; compute also
+# needs compute_max_instances > 0, and lua is the dial-in relay for compute
+# instances. (This is a TOML table, so it must sit below all top-level keys.)
+[cesplex_mounts]
+"/ces/file/1"    = "builtin:file"
+"/ces/peer/1"    = "builtin:peer"
+# "/ces/lua/1"     = "builtin:lua"
+# "/ces/compute/1" = "builtin:compute"
+
+# Transport caps on the rpc_port's RUDP (a TOML sub-table). max_channels_per_peer
+# is a CES opinion (default 2 — cesh/cesqt typically want a long-lived stream
+# open while issuing other ops). The two reorder caps bound per-channel
+# reassembly; -1 = leave the library default (currently 1 MB / 1024 messages).
+# channel_idle_secs: a channel idle this long is GC'd; raise it for long-lived
+# interactive dial terminals where a human pauses between commands.
+[rpc_rudp]
+max_channels_per_peer = )" << DEFAULT_RPC_RUDP_MAX_CHANNELS_PER_PEER << R"(
+max_reorder_bytes_per_channel = )" << DEFAULT_RPC_RUDP_MAX_REORDER_BYTES << R"(
+max_reorder_msgs_per_channel = )" << DEFAULT_RPC_RUDP_MAX_REORDER_MSGS << R"(
+channel_idle_secs = )" << DEFAULT_RPC_RUDP_CHANNEL_IDLE_SECS << R"(
+
+# /s/ extensions — operator-deployed Lua programs that get
+# autolaunched at boot. Drop dice.lua / chat.lua / etc. into
+# <storeDir>/s/; the server auto-generates the sidecar (owner =
+# server pubkey, file_balance = 0, /s/ is unmetered) and, for any
+# name listed below as truthy, launches one cesluajitd instance.
+# Programs in /s/ run with owner = server, so ces.transfer pulls
+# from the server's bottomless auto-topped account.
+#
+# Names are arbitrary; the value just needs to be truthy.
+# Requires: rpc_port > 0, builtin:file with file_store_max_bytes > 0,
+# and builtin:compute with compute_max_instances > 0.
+# [extension]
+# dice = 1         # /s/dice.lua
+# discovery = 1    # /s/discovery.lua (network registry crawler)
+# chat = 1         # /s/chat.lua, etc.
+
+# Peer servers
+# [[peers]]
+# key = "public_key_hex_of_peer_server"
+# address = "host:port"
+#
+# [[peers]]
+# key = "another_peer_key"
+# address = "host2:port2"
+)";
+}
+
+int main(int argc, char* argv[]) {
+  blog::enable("minx");
+  blog::enable("powengine");
+
+  // -- CLI Options --
+  std::string optLogLevel;
+  std::string optDataDir;
+  uint16_t optServerPort;
+  std::string optServerPrivKey;
+  uint64_t optMinAcc;
+  uint64_t optMaxAcc;
+  uint64_t optMinAsset;
+  uint64_t optMaxAsset;
+  uint64_t optMinAlias;
+  uint64_t optMaxAlias;
+  uint8_t optMinDiff;
+  uint64_t optPoWDelay;
+  uint64_t optSpendSlotSize;
+  std::string optGeneratePubKey;
+  uint64_t optFlushValue = DEFAULT_FLUSH_VALUE;
+  uint64_t optMaxLogSizeGB = DEFAULT_MAX_LOG_SIZE_GB;
+  int64_t optFeeAccount = -1;
+  int64_t optFeeAsset = -1;
+  int64_t optFeeTx = -1;
+  int64_t optFeeQuery = -1;
+  int64_t optFeeVmMult = -1;
+  bool optGenerateKeyPair = false;
+  bool optNoPowEngine = false;
+  bool optNoFeeDiscount = false;
+  bool optCacheOnlyPoWEngine = false;
+  int defaultOptTaskThreads =
+    static_cast<int>(std::thread::hardware_concurrency()) / 2 - 2;
+  int optTaskThreads = defaultOptTaskThreads;
+  if (optTaskThreads < 1) optTaskThreads = 1;
+  std::string optConfigFile;
+  std::string optServerName;
+  uint64_t optPeerTarget = DEFAULT_PEER_TARGET;
+  uint64_t optPeerPowInboundReciprocationBps = DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS;
+  int optPeerMinerInterval = DEFAULT_PEER_MINER_INTERVAL_SECS;
+  uint64_t optMaxPeers = DEFAULT_MAX_PEERS;
+  int optSettlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
+  uint64_t optMaxPeerReserveDisturbance = DEFAULT_MAX_PEER_RESERVE_DISTURBANCE;
+  uint32_t optGossipFanoutDegree = DEFAULT_GOSSIP_FANOUT_DEGREE;
+  std::string optAdminSocket;
+  uint16_t optWebPort = 0;
+  std::string optWebBind = DEFAULT_WEB_BIND;
+  bool optWebAllowPublic = false;
+  uint16_t optRpcPort = 0;
+  uint32_t optRpcMaxPending        = DEFAULT_RPC_MAX_PENDING;
+  uint64_t optRpcMaxRequestBytes   = DEFAULT_RPC_MAX_REQUEST_BYTES;
+  uint64_t optRpcMaxResponseBytes  = DEFAULT_RPC_MAX_RESPONSE_BYTES;
+  uint32_t optRpcResponseTimeoutMs = DEFAULT_RPC_RESPONSE_TIMEOUT_MS;
+  uint32_t optRpcRudpBytesPerSecond = DEFAULT_RPC_RUDP_BYTES_PER_SECOND;
+  uint32_t optRpcRudpBurstBytes     = DEFAULT_RPC_RUDP_BURST_BYTES;
+  uint64_t optRpcRudpMaxChannelsPerPeer        = DEFAULT_RPC_RUDP_MAX_CHANNELS_PER_PEER;
+  int64_t  optRpcRudpMaxReorderBytesPerChannel = -1;
+  int64_t  optRpcRudpMaxReorderMsgsPerChannel  = -1;
+  uint32_t optRpcRudpChannelIdleSecs           = DEFAULT_RPC_RUDP_CHANNEL_IDLE_SECS;
+  // File-storage feature (CesPlex builtin:file, v2).
+  uint64_t optFileStoreMaxBytes = 0;
+  std::string optFileStoreDir;
+  std::string optExtensionsDir;
+  uint64_t optExtFundingPerDay = DEFAULT_EXT_FUNDING_PER_DAY;
+  uint64_t optExtLocalBudget = DEFAULT_EXT_LOCAL_BUDGET;
+  int64_t optFeeFileRent  = -1;
+  int64_t optFeeFileWrite = -1;
+  int64_t optFeeFileRead  = -1;
+  // Compute feature (CesPlex builtin:compute).
+  uint32_t optComputeMaxInstances    = 0;
+  uint16_t optComputePortBase        = 0;   // 0 = no range (network off)
+  uint16_t optComputePortCount       = 0;   // ports in the range
+  uint64_t optComputeProcessMemMax   = DEFAULT_COMPUTE_PROCESS_MEM_MAX;
+  uint32_t optComputeClientPoolSize  = DEFAULT_COMPUTE_CLIENT_POOL_SIZE;
+  int64_t optFeeComputeCpuSec     = -1;
+  int64_t optFeeComputeRssByteSec = -1;
+  int64_t optFeeComputeNetByte    = -1;
+  int64_t optFeeComputeSlotSec    = -1;
+  int64_t optFeeBucketByteSec     = -1;
+  // net meter (ChannelMeter). 0 is a sentinel: the CesServer ctor derives a
+  // non-zero rate from the ledger anchors (floored to >= 1), so metering stays
+  // on. Pass an explicit non-zero to override.
+  uint64_t optFeeNetKiBSent       = 0;
+  uint64_t optFeeNetKiBReceived   = 0;
+  uint64_t optFeeNetChannelSec    = 0;
+  uint64_t optFeeNetMemByteDay    = 0;
+  std::string optComputeWorkDir;
+  std::string optComputeUser = DEFAULT_COMPUTE_USER;
+  // Empty default → auto-discover next to /proc/self/exe at startup
+  // (typical case: ces and cesluajitd are siblings in the same dir).
+  // Operators who want PATH lookup or an absolute path set it
+  // explicitly via TOML or --computechildbinary.
+  std::string optComputeChildBinary;
+  // /s/ extensions — operator-deployed Lua programs in
+  // <storeDir>/s/<name>.lua, autolaunched at boot when enabled.
+  // Names are arbitrary basenames; CLI flag is repeatable.
+  std::vector<std::string> optExtensions;
+#ifdef CES_MAIL
+  // Mail relay (SMTP submission for ces.mail.send / builtin:mail).
+  std::string optMailRelayHost;
+  uint16_t    optMailRelayPort = 587;
+  std::string optMailFrom, optMailUser, optMailPass;
+  uint64_t    optMailFeePerMB = 0;
+  uint64_t    optMailMaxEncodedBytes = 20ull * 1024 * 1024;
+#endif  // CES_MAIL
+  // CesPlex mounts — `proto=target` pairs. Target is
+  // "builtin:<name>" (statically linked handler).
+  std::vector<std::string> optCesplexMounts;
+  std::vector<std::string> optPeers; // key@host:port
+  std::string optCreditAccount, optDebitAccount;
+  int64_t optCreditAmount = 0, optDebitAmount = 0;
+  CLI::App* cmd_credit = nullptr;
+  CLI::App* cmd_debit = nullptr;
+  CLI::App* cmd_snapshot = nullptr;
+
+  CLI::App app{"ces"};
+  try {
+#ifndef CES_GIT_HASH
+#define CES_GIT_HASH "unknown"
+#endif
+    app.set_version_flag("--version", std::string(CES_GIT_HASH));
+    app.add_option("-l,--loglevel", optLogLevel,
+      "Log level ([t]race, [d]ebug, [i]nfo, [w]arning, [e]rror, [f]atal)")
+      ->default_val("info");
+    app.add_option("-d,--datadir", optDataDir, "Data directory")
+      ->default_val(DEFAULT_DATA_DIR);
+    app.add_option("-p,--port", optServerPort, "Server port")
+      ->default_val(DEFAULT_PORT);
+    app.add_option("-k,--serverkey", optServerPrivKey,
+      "Server key (32-byte hex)")
+      ->default_val(DEFAULT_PRIV_KEY_HEX_STR);
+    app.add_option("--minacc", optMinAcc,
+      "Reserved account DB store capacity")
+      ->default_val(std::to_string(DEFAULT_MIN_ACC));
+    app.add_option("--maxacc", optMaxAcc,
+      "Maximum account DB size")
+      ->default_val(std::to_string(DEFAULT_MAX_ACC));
+    app.add_option("--minasset", optMinAsset,
+      "Reserved asset DB store capacity")
+      ->default_val(std::to_string(DEFAULT_MIN_ASSET));
+    app.add_option("--maxasset", optMaxAsset,
+      "Maximum asset DB size")
+      ->default_val(std::to_string(DEFAULT_MAX_ASSET));
+    app.add_option("--minalias", optMinAlias,
+      "Reserved alias DB store capacity")
+      ->default_val(std::to_string(DEFAULT_MIN_ALIAS));
+    app.add_option("--maxalias", optMaxAlias,
+      "Maximum alias DB size")
+      ->default_val(std::to_string(DEFAULT_MAX_ALIAS));
+    app.add_option("--flushvalue", optFlushValue,
+      "Minimum value delta for flushing")
+      ->default_val(std::to_string(DEFAULT_FLUSH_VALUE));
+    app.add_option("--mindiff", optMinDiff,
+      "Minimum proof-of-work difficulty")
+      ->default_val(std::to_string(DEFAULT_MIN_DIFF));
+    app.add_option("--powdelay", optPoWDelay,
+      "Delay in seconds before accepting PoW")
+      ->default_val(std::to_string(DEFAULT_POW_DELAY));
+    app.add_option("--spendslotsize", optSpendSlotSize,
+      "Size of spend db slots in seconds")
+      ->default_val(std::to_string(DEFAULT_SPEND_SLOT_SIZE));
+    app.add_option("--genpubkey", optGeneratePubKey,
+      "Generate public key from private key")->default_val("");
+    app.add_option("--threads", optTaskThreads,
+      "Number of task processing threads")->default_val(defaultOptTaskThreads);
+    app.add_option("--maxlogsize", optMaxLogSizeGB,
+      "Max events log size in GB (0=disable)")
+      ->default_val(std::to_string(DEFAULT_MAX_LOG_SIZE_GB));
+    app.add_flag("--genkeypair", optGenerateKeyPair,
+      "Generate a new Ed25519 key pair");
+    app.add_flag("--nopowengine,-x", optNoPowEngine,
+      "Don't create the RandomX verifier");
+    app.add_flag("--cacheonlypowengine,-c", optCacheOnlyPoWEngine,
+      "Cache-only RandomX verifier (slower, less RAM)");
+    app.add_flag("--nofeediscount", optNoFeeDiscount,
+      "Disable the load-based fee discount (pin every fee at full price). For "
+      "tests/benchmarks that need fees to actually bite.");
+    app.add_option("--feeaccount", optFeeAccount, "Fee for account rent");
+    app.add_option("--feeasset", optFeeAsset, "Fee for asset operations");
+    app.add_option("--feetx", optFeeTx, "Fee for transactions");
+    app.add_option("--feequery", optFeeQuery, "Fee for queries");
+    app.add_option("--feevmmult", optFeeVmMult, "VM gas cost multiplier");
+    app.add_option("--config", optConfigFile,
+      "Load TOML config file (no arg = dump default config)")
+      ->expected(0, 1);
+    app.add_option("--servername", optServerName,
+      "Server's public address (e.g. myserver.com:53830)");
+    app.add_option("--peertarget", optPeerTarget,
+      "Credit target on each peer server")
+      ->default_val(std::to_string(DEFAULT_PEER_TARGET));
+    app.add_option("--peerpowinboundreciprocationbps",
+      optPeerPowInboundReciprocationBps,
+      "Inbound PoW reciprocation, basis points (0=off, 10000=1:1)")
+      ->default_val(std::to_string(DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS));
+    app.add_option("--peerminerinterval", optPeerMinerInterval,
+      "Seconds between peer miner cycles (default 60; lower for local/dev)")
+      ->default_val(std::to_string(DEFAULT_PEER_MINER_INTERVAL_SECS));
+    app.add_option("--maxpeers", optMaxPeers,
+      "Peer-table size (persisted/exposed; RAM holds 3x). Small bounds the view")
+      ->default_val(std::to_string(DEFAULT_MAX_PEERS));
+    app.add_option("--settlementretries", optSettlementMaxRetries,
+      "Async settlement max retries (1 = no retries)")
+      ->default_val(std::to_string(CesClientAsync::DEFAULT_MAX_RETRIES));
+    app.add_option("--maxpeerreservedisturbance", optMaxPeerReserveDisturbance,
+      "Max reserve (raw) one op may spend at one peer; caps each gossip "
+      "fan-out leg, remainder refunds the originator (0 = uncapped)")
+      ->default_val(std::to_string(DEFAULT_MAX_PEER_RESERVE_DISTURBANCE));
+    app.add_option("--gossipfanoutdegree", optGossipFanoutDegree,
+      "Peers each gossip hop forwards to, a random subset of funded peers "
+      "(0 = forward to every peer)")
+      ->default_val(std::to_string(DEFAULT_GOSSIP_FANOUT_DEGREE));
+    app.add_option("--adminsocket", optAdminSocket,
+      "Admin console Unix socket path (empty = disabled)")->default_val("");
+    app.add_option("--webport", optWebPort,
+      "Web dashboard port (0 = disabled). Loopback only, no auth — "
+      "reach it via SSH tunnel.")->default_val("0");
+    app.add_option("--webbind", optWebBind,
+      "Web dashboard bind address (loopback by design)")
+      ->default_val(DEFAULT_WEB_BIND);
+    app.add_flag("--web-allow-public", optWebAllowPublic,
+      "Permit a non-loopback web_bind despite the dashboard having no auth "
+      "(exposes a credit/debit surface; off by default)");
+    app.add_option("--rpcport", optRpcPort,
+      "Dedicated MINX/RUDP UDP port for the SYS_RPC syscall "
+      "(0 = disabled)")->default_val("0");
+    app.add_option("--rpcmaxpending", optRpcMaxPending,
+      "SYS_RPC: max concurrent outbound calls in flight")
+      ->default_val(std::to_string(DEFAULT_RPC_MAX_PENDING));
+    app.add_option("--rpcmaxreqbytes", optRpcMaxRequestBytes,
+      "SYS_RPC: max request body size in bytes")
+      ->default_val(std::to_string(DEFAULT_RPC_MAX_REQUEST_BYTES));
+    app.add_option("--rpcmaxrespbytes", optRpcMaxResponseBytes,
+      "SYS_RPC: max response body size in bytes")
+      ->default_val(std::to_string(DEFAULT_RPC_MAX_RESPONSE_BYTES));
+    app.add_option("--rpctimeoutms", optRpcResponseTimeoutMs,
+      "SYS_RPC: per-call response timeout in milliseconds")
+      ->default_val(std::to_string(DEFAULT_RPC_RESPONSE_TIMEOUT_MS));
+    app.add_option("--rpcrudpbps", optRpcRudpBytesPerSecond,
+      "SYS_RPC: per-channel RUDP pacing rate in bytes/sec "
+      "(0xFFFFFFFF = unlimited)")
+      ->default_val(std::to_string(DEFAULT_RPC_RUDP_BYTES_PER_SECOND));
+    app.add_option("--rpcrudpburst", optRpcRudpBurstBytes,
+      "SYS_RPC: per-channel RUDP burst bytes "
+      "(0xFFFFFFFF = unlimited)")
+      ->default_val(std::to_string(DEFAULT_RPC_RUDP_BURST_BYTES));
+    app.add_option("--rpcrudpmaxchannels",
+      optRpcRudpMaxChannelsPerPeer,
+      "rpc_port RUDP: max RUDP channels per peer "
+      "(CES default 2 — long-lived dial + side ops)")
+      ->default_val(std::to_string(DEFAULT_RPC_RUDP_MAX_CHANNELS_PER_PEER));
+    app.add_option("--rpcrudpmaxreorderbytes",
+      optRpcRudpMaxReorderBytesPerChannel,
+      "rpc_port RUDP: per-channel reorder buffer cap in bytes "
+      "(-1 = library default)")
+      ->default_val(std::to_string(DEFAULT_RPC_RUDP_MAX_REORDER_BYTES));
+    app.add_option("--rpcrudpmaxreordermsgs",
+      optRpcRudpMaxReorderMsgsPerChannel,
+      "rpc_port RUDP: per-channel reorder buffer cap in messages "
+      "(-1 = library default)")
+      ->default_val(std::to_string(DEFAULT_RPC_RUDP_MAX_REORDER_MSGS));
+    app.add_option("--rpcrudpidlesecs", optRpcRudpChannelIdleSecs,
+      "rpc_port RUDP channel idle-GC timeout in seconds (default 60). A channel "
+      "with no traffic for this long is dropped; raise it for long-lived "
+      "interactive dial terminals where a human pauses between commands.")
+      ->default_val(std::to_string(DEFAULT_RPC_RUDP_CHANNEL_IDLE_SECS));
+    app.add_option("--peer", optPeers,
+      "Peer server as key@host:port (repeatable)");
+
+#ifdef CES_MAIL
+    // --- Mail relay (ces.mail.send / builtin:mail) ---
+    app.add_option("--mailrelayhost", optMailRelayHost,
+      "SMTP submission relay host for outbound mail (empty = log + drop)")
+      ->default_val("");
+    app.add_option("--mailrelayport", optMailRelayPort,
+      "SMTP submission relay port")->default_val("587");
+    app.add_option("--mailfrom", optMailFrom,
+      "From address for outbound mail")->default_val("");
+    app.add_option("--mailuser", optMailUser,
+      "SMTP AUTH LOGIN user (empty = no AUTH)")->default_val("");
+    app.add_option("--mailpass", optMailPass,
+      "SMTP AUTH LOGIN password (empty = no AUTH)")->default_val("");
+    app.add_option("--mailfeepermb", optMailFeePerMB,
+      "Credits burned per MB of outgoing mail (0 = free)")->default_val("0");
+    app.add_option("--mailmaxencodedbytes", optMailMaxEncodedBytes,
+      "Max encoded size of one email, bytes")
+      ->default_val(std::to_string(20ull * 1024 * 1024));
+#endif  // CES_MAIL
+
+    // --- File-storage feature (CesPlex builtin:file) ---
+    app.add_option("--filestoremaxbytes", optFileStoreMaxBytes,
+      "File-storage feature max bytes (0 = feature off, >0 = hard cap "
+      "on total stored bytes)")->default_val("0");
+    app.add_option("--filestoredir", optFileStoreDir,
+      "File-storage directory (empty = <datadir>/cesfilestore/)")
+      ->default_val("");
+    app.add_option("--extensionsdir", optExtensionsDir,
+      "Read-only extension catalog directory (empty = none)")
+      ->default_val("");
+    app.add_option("--extfundingperday", optExtFundingPerDay,
+      "Extension funding budget: global raw credit units/day the server grants "
+      "ces.request_funds petitions (0 = off)")->default_val(std::to_string(DEFAULT_EXT_FUNDING_PER_DAY));
+    app.add_option("--extlocalbudget", optExtLocalBudget,
+      "Local extension budget: raw credit units each /s/ program account is topped "
+      "up to on boot and daily (0 = off)")->default_val(std::to_string(DEFAULT_EXT_LOCAL_BUDGET));
+    app.add_option("--feefilerent", optFeeFileRent,
+      "File-storage rent fee (credits per byte per day, -1 = default)");
+    app.add_option("--feefilewrite", optFeeFileWrite,
+      "File-storage write fee (credits per KB, -1 = default)");
+    app.add_option("--feefileread", optFeeFileRead,
+      "File-storage read fee (credits per KB, -1 = default)");
+    app.add_option("--cesplexmount", optCesplexMounts,
+      "CesPlex mount as proto=target "
+      "(e.g. /ces/file/1=builtin:file; repeatable)");
+
+    // --- Compute feature (CesPlex builtin:compute) ---
+    app.add_option("--computemaxinstances", optComputeMaxInstances,
+      "Compute feature max concurrent instances "
+      "(0 = feature off)")->default_val("0");
+    app.add_option("--computeportbase", optComputePortBase,
+      "Base UDP port for the L2 compute program range. 0 = ephemeral "
+      "(loopback dev only). Open [base, base+count-1] at the firewall "
+      "to match.")->default_val("0");
+    app.add_option("--computeportcount", optComputePortCount,
+      "Number of UDP ports in the L2 compute program range "
+      "(independent of computemaxinstances).")->default_val("0");
+    app.add_option("--computeprocessmemmax", optComputeProcessMemMax,
+      "Per-process memory ceiling in bytes (child RLIMIT_AS)")
+      ->default_val(std::to_string(DEFAULT_COMPUTE_PROCESS_MEM_MAX));
+    app.add_option("--computeclientpoolsize", optComputeClientPoolSize,
+      "Worker threads per Lua child for outbound file_client/compute_client "
+      "calls (concurrent in-flight verb round-trips; clamped 1..64)")
+      ->default_val(std::to_string(DEFAULT_COMPUTE_CLIENT_POOL_SIZE));
+    app.add_option("--feecomputecpusec", optFeeComputeCpuSec,
+      "Compute fee for CPU time (credits per second, -1 = default)");
+    app.add_option("--feecomputerssbyteday", optFeeComputeRssByteSec,
+      "Compute fee for RSS (credits per byte per second, -1 = default)");
+    app.add_option("--feecomputenetbyte", optFeeComputeNetByte,
+      "Compute fee for outbound app bytes (credits per byte, -1 = default)");
+    app.add_option("--feecomputeslotsec", optFeeComputeSlotSec,
+      "Compute fee for just existing / occupying a monitoring slot "
+      "(credits per second, -1 = default)");
+    app.add_option("--feebucketbytesec", optFeeBucketByteSec,
+      "Bucket cache fee per byte per second of declared capacity "
+      "(credits, -1 = derive from feeComputeRssByteDay)");
+    app.add_option("--feenetkibsent", optFeeNetKiBSent,
+      "Net meter: credits per KiB sent server->client (0 = derive default)");
+    app.add_option("--feenetkibreceived", optFeeNetKiBReceived,
+      "Net meter: credits per KiB received client->server (0 = derive default)");
+    app.add_option("--feenetchannelsec", optFeeNetChannelSec,
+      "Net meter: credits per channel-second open (0 = observe only)");
+    app.add_option("--feenetmembyteday", optFeeNetMemByteDay,
+      "Net meter: credits per RUDP-buffer byte-day (0 = observe only)");
+    app.add_option("--computeworkdir", optComputeWorkDir,
+      "Compute per-instance scratch / IPC socket dir "
+      "(empty = <datadir>/cescompute/)")->default_val("");
+    app.add_option("--computeuser", optComputeUser,
+      "Unix user cesluad child processes drop to")
+      ->default_val(DEFAULT_COMPUTE_USER);
+    app.add_option("--computechildbinary", optComputeChildBinary,
+      "Compute child binary path. Empty default = auto-discover "
+      "`cesluajitd` next to ces's own binary (/proc/self/exe), with "
+      "bare-name PATH fallback. Set explicitly to bypass discovery.");
+
+    // --- /s/ extensions ---
+    // Repeatable: --extension dice --extension chat. Each entry
+    // is the basename of a Lua file the operator deployed to
+    // <storeDir>/s/<name>.lua; the server autolaunches one
+    // cesluajitd instance per entry at boot.
+    app.add_option("--extension", optExtensions,
+      "Autolaunch /s/<name>.lua at boot (repeatable)");
+
+    // -- Subcommands (mutually exclusive with running the server) --
+    cmd_credit = app.add_subcommand("credit",
+      "Credit an account and exit (no server run)");
+    cmd_credit->add_option("amount", optCreditAmount, "Amount to credit")
+      ->required();
+    cmd_credit->add_option("account", optCreditAccount,
+      "Full public key hex (64 chars)")->required();
+
+    cmd_debit = app.add_subcommand("debit",
+      "Debit an account and exit (no server run)");
+    cmd_debit->add_option("amount", optDebitAmount, "Amount to debit")
+      ->required();
+    cmd_debit->add_option("account", optDebitAccount,
+      "Full public key hex (64 chars)")->required();
+
+    cmd_snapshot = app.add_subcommand("snapshot",
+      "Load data, write a snapshot, and exit (no server run)");
+
+    app.require_subcommand(0, 1);
+
+    app.parse(argc, argv);
+  } catch (const CLI::ParseError& e) {
+    return app.exit(e);
+  }
+
+  // -- --config with no argument: dump default config and exit --
+  if (app.count("--config") && optConfigFile.empty()) {
+    dumpDefaultConfig();
+    return 0;
+  }
+
+  // -- Load config file (if provided), then let CLI switches override --
+  if (!optConfigFile.empty()) {
+    try {
+      auto tbl = toml::parse_file(optConfigFile);
+
+      // Helper: apply a TOML value into `var` only if the matching CLI
+      // flag wasn't explicitly set on the command line. Precedence is
+      // CLI > TOML > compiled default.
+      auto applyIfDefault = [&](const char* tomlKey, auto& var,
+                                 const char* cliFlag) {
+        if (app[cliFlag]->count() != 0)
+          return;  // CLI wins
+        auto v = tbl[tomlKey];
+        if (!v)
+          return;  // not in config file
+        using T = std::decay_t<decltype(var)>;
+        if constexpr (std::is_same_v<T, std::string> ||
+                      std::is_same_v<T, bool>)
+          var = v.value_or(var);
+        else if constexpr (std::is_same_v<T, uint8_t>)
+          var = static_cast<uint8_t>(v.value_or(static_cast<int64_t>(var)));
+        else if constexpr (std::is_same_v<T, uint16_t>)
+          var = static_cast<uint16_t>(v.value_or(static_cast<int64_t>(var)));
+        else if constexpr (std::is_same_v<T, int>)
+          var = static_cast<int>(v.value_or(static_cast<int64_t>(var)));
+        else
+          var = static_cast<T>(v.value_or(static_cast<int64_t>(var)));
+      };
+
+      applyIfDefault("log_level", optLogLevel, "--loglevel");
+      applyIfDefault("data_dir", optDataDir, "--datadir");
+      applyIfDefault("port", optServerPort, "--port");
+      applyIfDefault("server_key", optServerPrivKey, "--serverkey");
+      applyIfDefault("min_difficulty", optMinDiff, "--mindiff");
+      applyIfDefault("pow_delay", optPoWDelay, "--powdelay");
+      applyIfDefault("spend_slot_size", optSpendSlotSize, "--spendslotsize");
+      applyIfDefault("no_pow_engine", optNoPowEngine, "--nopowengine");
+      applyIfDefault("cache_only_pow", optCacheOnlyPoWEngine, "--cacheonlypowengine");
+      applyIfDefault("threads", optTaskThreads, "--threads");
+      applyIfDefault("min_accounts", optMinAcc, "--minacc");
+      applyIfDefault("max_accounts", optMaxAcc, "--maxacc");
+      applyIfDefault("min_assets", optMinAsset, "--minasset");
+      applyIfDefault("max_assets", optMaxAsset, "--maxasset");
+      applyIfDefault("min_aliases", optMinAlias, "--minalias");
+      applyIfDefault("max_aliases", optMaxAlias, "--maxalias");
+      applyIfDefault("flush_value", optFlushValue, "--flushvalue");
+      applyIfDefault("max_log_size_gb", optMaxLogSizeGB, "--maxlogsize");
+      applyIfDefault("server_name", optServerName, "--servername");
+      applyIfDefault("peer_target", optPeerTarget, "--peertarget");
+      applyIfDefault("peer_pow_inbound_reciprocation_bps",
+                     optPeerPowInboundReciprocationBps,
+                     "--peerpowinboundreciprocationbps");
+      applyIfDefault("peer_miner_interval", optPeerMinerInterval,
+                     "--peerminerinterval");
+      applyIfDefault("max_peers", optMaxPeers, "--maxpeers");
+      applyIfDefault("settlement_max_retries", optSettlementMaxRetries, "--settlementretries");
+      applyIfDefault("max_peer_reserve_disturbance", optMaxPeerReserveDisturbance,
+                     "--maxpeerreservedisturbance");
+      applyIfDefault("gossip_fanout_degree", optGossipFanoutDegree,
+                     "--gossipfanoutdegree");
+      applyIfDefault("admin_socket", optAdminSocket, "--adminsocket");
+      applyIfDefault("web_port", optWebPort, "--webport");
+      applyIfDefault("web_bind", optWebBind, "--webbind");
+      applyIfDefault("web_allow_public", optWebAllowPublic, "--web-allow-public");
+      applyIfDefault("rpc_port", optRpcPort, "--rpcport");
+      applyIfDefault("rpc_max_pending", optRpcMaxPending, "--rpcmaxpending");
+      applyIfDefault("rpc_max_request_bytes", optRpcMaxRequestBytes, "--rpcmaxreqbytes");
+      applyIfDefault("rpc_max_response_bytes", optRpcMaxResponseBytes, "--rpcmaxrespbytes");
+      applyIfDefault("rpc_response_timeout_ms", optRpcResponseTimeoutMs, "--rpctimeoutms");
+      applyIfDefault("rpc_rudp_bytes_per_second", optRpcRudpBytesPerSecond, "--rpcrudpbps");
+      applyIfDefault("rpc_rudp_burst_bytes", optRpcRudpBurstBytes, "--rpcrudpburst");
+
+      // [rpc_rudp] table — transport caps on the rpc_port. Mirror the
+      // CLI > TOML precedence the rest of the loader uses.
+      if (auto t = tbl["rpc_rudp"].as_table()) {
+        if (app["--rpcrudpmaxchannels"]->count() == 0) {
+          if (auto v = (*t)["max_channels_per_peer"].value<int64_t>();
+              v && *v >= 0)
+            optRpcRudpMaxChannelsPerPeer = static_cast<uint64_t>(*v);
+        }
+        if (app["--rpcrudpmaxreorderbytes"]->count() == 0) {
+          if (auto v = (*t)["max_reorder_bytes_per_channel"].value<int64_t>())
+            optRpcRudpMaxReorderBytesPerChannel = *v;
+        }
+        if (app["--rpcrudpmaxreordermsgs"]->count() == 0) {
+          if (auto v = (*t)["max_reorder_msgs_per_channel"].value<int64_t>())
+            optRpcRudpMaxReorderMsgsPerChannel = *v;
+        }
+        if (app["--rpcrudpidlesecs"]->count() == 0) {
+          if (auto v = (*t)["channel_idle_secs"].value<int64_t>(); v && *v > 0)
+            optRpcRudpChannelIdleSecs = static_cast<uint32_t>(*v);
+        }
+      }
+
+      // Fees: config uses the same -1 = unset convention as the CLI.
+      applyIfDefault("fee_account", optFeeAccount, "--feeaccount");
+      applyIfDefault("fee_asset",   optFeeAsset,   "--feeasset");
+      applyIfDefault("fee_tx",      optFeeTx,      "--feetx");
+      applyIfDefault("fee_query",   optFeeQuery,   "--feequery");
+      applyIfDefault("fee_vm_mult", optFeeVmMult,  "--feevmmult");
+
+      // File-storage feature knobs.
+      applyIfDefault("file_store_max_bytes", optFileStoreMaxBytes,
+                     "--filestoremaxbytes");
+      applyIfDefault("file_store_dir", optFileStoreDir, "--filestoredir");
+      applyIfDefault("extensions_dir", optExtensionsDir, "--extensionsdir");
+      applyIfDefault("ext_funding_per_day", optExtFundingPerDay,
+                     "--extfundingperday");
+      applyIfDefault("ext_local_budget", optExtLocalBudget,
+                     "--extlocalbudget");
+      applyIfDefault("fee_file_rent",  optFeeFileRent,  "--feefilerent");
+      applyIfDefault("fee_file_write", optFeeFileWrite, "--feefilewrite");
+      applyIfDefault("fee_file_read",  optFeeFileRead,  "--feefileread");
+
+#ifdef CES_MAIL
+      // Mail relay (ces.mail.send / builtin:mail).
+      applyIfDefault("mail_relay_host", optMailRelayHost, "--mailrelayhost");
+      applyIfDefault("mail_relay_port", optMailRelayPort, "--mailrelayport");
+      applyIfDefault("mail_from",       optMailFrom,      "--mailfrom");
+      applyIfDefault("mail_user",       optMailUser,      "--mailuser");
+      applyIfDefault("mail_pass",       optMailPass,      "--mailpass");
+      applyIfDefault("mail_fee_per_mb", optMailFeePerMB,  "--mailfeepermb");
+      applyIfDefault("mail_max_encoded_bytes", optMailMaxEncodedBytes,
+                     "--mailmaxencodedbytes");
+#endif  // CES_MAIL
+
+      // Compute feature knobs.
+      applyIfDefault("compute_max_instances",    optComputeMaxInstances,
+                     "--computemaxinstances");
+      applyIfDefault("compute_port_base",        optComputePortBase,
+                     "--computeportbase");
+      applyIfDefault("compute_port_count",       optComputePortCount,
+                     "--computeportcount");
+      applyIfDefault("compute_process_mem_max",  optComputeProcessMemMax,
+                     "--computeprocessmemmax");
+      applyIfDefault("compute_client_pool_size", optComputeClientPoolSize,
+                     "--computeclientpoolsize");
+      applyIfDefault("fee_compute_cpu_sec",      optFeeComputeCpuSec,
+                     "--feecomputecpusec");
+      applyIfDefault("fee_compute_rss_byte_day", optFeeComputeRssByteSec,
+                     "--feecomputerssbyteday");
+      applyIfDefault("fee_compute_net_byte",     optFeeComputeNetByte,
+                     "--feecomputenetbyte");
+      applyIfDefault("fee_compute_slot_sec",     optFeeComputeSlotSec,
+                     "--feecomputeslotsec");
+      applyIfDefault("fee_bucket_byte_sec",      optFeeBucketByteSec,
+                     "--feebucketbytesec");
+      applyIfDefault("fee_net_kib_sent",         optFeeNetKiBSent,
+                     "--feenetkibsent");
+      applyIfDefault("fee_net_kib_received",     optFeeNetKiBReceived,
+                     "--feenetkibreceived");
+      applyIfDefault("fee_net_channel_sec",      optFeeNetChannelSec,
+                     "--feenetchannelsec");
+      applyIfDefault("fee_net_mem_byte_day",     optFeeNetMemByteDay,
+                     "--feenetmembyteday");
+      applyIfDefault("compute_work_dir",         optComputeWorkDir,
+                     "--computeworkdir");
+      applyIfDefault("compute_user",             optComputeUser,
+                     "--computeuser");
+      applyIfDefault("compute_child_binary",     optComputeChildBinary,
+                     "--computechildbinary");
+
+      // /s/ extensions from config. Names are arbitrary; any
+      // truthy entry enables autolaunch of /s/<name>.lua. CLI's
+      // repeatable --extension overrides the TOML list when set.
+      //   [extension]
+      //   dice = 1
+      //   chat = 1
+      if (optExtensions.empty()) {
+        if (auto t = tbl["extension"].as_table()) {
+          for (auto& [k, v] : *t) {
+            bool enabled = false;
+            if (auto i = v.value<int64_t>()) enabled = (*i != 0);
+            else if (auto b = v.value<bool>()) enabled = *b;
+            if (enabled) optExtensions.push_back(std::string(k.str()));
+          }
+        }
+      }
+
+      // CesPlex mounts from config (only if no --cesplexmount on CLI).
+      // TOML shape:
+      //   [cesplex_mounts]
+      //   "/ces/file/1" = "builtin:file"
+      if (optCesplexMounts.empty()) {
+        if (auto t = tbl["cesplex_mounts"].as_table()) {
+          for (auto& [k, v] : *t) {
+            auto s = v.value<std::string>();
+            if (s && !s->empty())
+              optCesplexMounts.push_back(
+                std::string(k.str()) + "=" + *s);
+          }
+        }
+      }
+
+      // Peers from config (only if no CLI peers specified)
+      if (optPeers.empty()) {
+        if (auto peers = tbl["peers"].as_array()) {
+          for (auto& p : *peers) {
+            if (auto t = p.as_table()) {
+              auto key = (*t)["key"].value_or(std::string(""));
+              auto addr = (*t)["address"].value_or(std::string(""));
+              if (!key.empty() && !addr.empty())
+                optPeers.push_back(key + "@" + addr);
+            }
+          }
+        }
+      }
+
+    } catch (const toml::parse_error& err) {
+      std::cerr << "Config parse error: " << err.description() << "\n"
+                << "  " << err.source().path->c_str() << ":"
+                << err.source().begin.line << "\n";
+      return 1;
+    }
+  }
+
+  // -- Setup logging --
+  try {
+    ces::setupLogger(optLogLevel);
+  } catch (const std::exception& e) {
+    std::cerr << "ERROR: " << e.what() << std::endl;
+    std::exit(1);
+  }
+
+  // -- Key generation utilities (exit after) --
+  if (optGenerateKeyPair) {
+    KeyPair keyPair;
+    dumpKeyPair(keyPair);
+  }
+  if (!optGeneratePubKey.empty()) {
+    KeyPair keyPair(optGeneratePubKey);
+    dumpKeyPair(keyPair);
+  }
+
+  // -- Validate peers (key@host:port) --
+  for (auto& p : optPeers) {
+    if (p.find('@') == std::string::npos) {
+      std::cerr << "ERROR: invalid peer format (expected key@host:port): " << p << "\n";
+      return 1;
+    }
+  }
+
+  LOGINFO << "ces start" << VAL("version", CES_GIT_HASH);
+
+  minx::Hash serverPrivKey;
+  if (optServerPrivKey.size() != 64) {
+    std::cerr << "Error: server_key must be a 64-character hex string.\n"
+              << "Generate one with: ces --genkeypair\n";
+    return 1;
+  }
+  try {
+    minx::stringToHash(serverPrivKey, optServerPrivKey);
+  } catch (std::exception& e) {
+    std::cerr << "Error: invalid server_key: " << e.what() << "\n";
+    return 1;
+  }
+
+  if (optServerPrivKey == DEFAULT_PRIV_KEY_HEX_STR)
+    LOGWARNING << "server_key is the well-known default sample key; generate "
+                  "your own with ces --genkeypair (every ces --config dump "
+                  "mints a fresh one)";
+
+  // -- Configure server --
+  CesConfig config;
+  config.dataDir = optDataDir;
+  config.serverPrivKey = serverPrivKey;
+  config.version = CES_GIT_HASH;
+  config.minAcc = optMinAcc;
+  config.maxAcc = optMaxAcc;
+  config.minAsset = optMinAsset;
+  config.maxAsset = optMaxAsset;
+  config.minAlias = optMinAlias;
+  config.maxAlias = optMaxAlias;
+  config.minDiff = optMinDiff;
+  config.spendSlotSize = optSpendSlotSize;
+  config.taskThreads = optTaskThreads;
+  config.flushValue = optFlushValue;
+  config.maxLogBytes = optMaxLogSizeGB * 1024ULL * 1024 * 1024;
+
+  if (optFeeAccount >= 0) config.feeAccount = static_cast<uint64_t>(optFeeAccount);
+  if (optFeeAsset >= 0)   config.feeAsset   = static_cast<uint64_t>(optFeeAsset);
+  if (optFeeTx >= 0)      config.feeTx      = static_cast<uint64_t>(optFeeTx);
+  if (optFeeQuery >= 0)   config.feeQuery   = static_cast<uint64_t>(optFeeQuery);
+  if (optFeeVmMult >= 0)  config.feeVmMult  = static_cast<uint64_t>(optFeeVmMult);
+  if (optNoFeeDiscount)   config.feeDiscountEnabled = false;
+
+  uint64_t now = minx::getSecsSinceEpoch();
+  if (optPoWDelay > 0)
+    config.minProveWorkTimestamp = now + optPoWDelay;
+  else
+    config.minProveWorkTimestamp = 0;
+
+  // Trim and normalize server name (empty/whitespace = unset)
+  {
+    auto s = optServerName;
+    s.erase(0, s.find_first_not_of(" \t\r\n"));
+    s.erase(s.find_last_not_of(" \t\r\n") + 1);
+    config.serverName = s;
+  }
+  config.peerTarget = optPeerTarget;
+  config.peerPowInboundReciprocationBps = optPeerPowInboundReciprocationBps;
+  config.peerMinerIntervalSecs = optPeerMinerInterval;
+  config.maxPeers = static_cast<size_t>(optMaxPeers < 1 ? 1 : optMaxPeers);
+  config.settlementMaxRetries = optSettlementMaxRetries;
+  config.maxPeerReserveDisturbance = optMaxPeerReserveDisturbance;
+  config.gossipFanoutDegree = optGossipFanoutDegree;
+  config.adminSocket = optAdminSocket;
+  config.webPort = optWebPort;
+  config.webBind = optWebBind;
+  config.webAllowPublic = optWebAllowPublic;
+  config.rpcPort = optRpcPort;
+  config.rpcMaxPending        = optRpcMaxPending;
+  config.rpcMaxRequestBytes   = static_cast<size_t>(optRpcMaxRequestBytes);
+  config.rpcMaxResponseBytes  = static_cast<size_t>(optRpcMaxResponseBytes);
+  config.rpcResponseTimeoutMs = optRpcResponseTimeoutMs;
+  config.rpcRudpBytesPerSecond = optRpcRudpBytesPerSecond;
+  config.rpcRudpBurstBytes     = optRpcRudpBurstBytes;
+  config.rpcRudpMaxChannelsPerPeer        = static_cast<size_t>(optRpcRudpMaxChannelsPerPeer);
+  config.rpcRudpMaxReorderBytesPerChannel = optRpcRudpMaxReorderBytesPerChannel;
+  config.rpcRudpMaxReorderMsgsPerChannel  = optRpcRudpMaxReorderMsgsPerChannel;
+  config.rpcRudpChannelIdleSecs           = optRpcRudpChannelIdleSecs;
+
+  // File-storage feature config.
+  config.cesFileStoreMaxBytes = optFileStoreMaxBytes;
+  config.cesFileStoreDir      = optFileStoreDir;
+  config.cesExtensionsDir     = optExtensionsDir;
+
+#ifdef CES_MAIL
+  // Mail relay (ces.mail.send / builtin:mail). Empty relay host => log + drop.
+  config.mailRelayHost = optMailRelayHost;
+  config.mailRelayPort = optMailRelayPort;
+  config.mailFrom      = optMailFrom;
+  config.mailUser      = optMailUser;
+  config.mailPass      = optMailPass;
+  config.mailFeePerMB        = optMailFeePerMB;
+  config.mailMaxEncodedBytes = optMailMaxEncodedBytes;
+#endif  // CES_MAIL
+  config.extFundingPerDay     = optExtFundingPerDay;
+  config.extLocalBudget       = optExtLocalBudget;
+  if (optFeeFileRent  >= 0) config.feeFileRent  = optFeeFileRent;
+  if (optFeeFileWrite >= 0) config.feeFileWrite = optFeeFileWrite;
+  if (optFeeFileRead  >= 0) config.feeFileRead  = optFeeFileRead;
+
+  // Compute feature config.
+  config.computeMaxInstances   = optComputeMaxInstances;
+  config.computePortBase       = optComputePortBase;
+  config.computePortCount      = optComputePortCount;
+  config.computeProcessMemMax  = optComputeProcessMemMax;
+  config.computeClientPoolSize = optComputeClientPoolSize;
+  if (optFeeComputeCpuSec     >= 0)
+    config.feeComputeCpuSec     = optFeeComputeCpuSec;
+  if (optFeeComputeRssByteSec >= 0)
+    config.feeComputeRssByteDay = optFeeComputeRssByteSec;
+  if (optFeeComputeNetByte    >= 0)
+    config.feeComputeNetByte    = optFeeComputeNetByte;
+  if (optFeeComputeSlotSec    >= 0)
+    config.feeComputeSlotSec    = optFeeComputeSlotSec;
+  if (optFeeBucketByteSec     >= 0)
+    config.feeBucketByteSec     = optFeeBucketByteSec;
+  config.feeNetKiBSent        = optFeeNetKiBSent;
+  config.feeNetKiBReceived    = optFeeNetKiBReceived;
+  config.feeNetChannelSec     = optFeeNetChannelSec;
+  config.feeNetMemByteDay     = optFeeNetMemByteDay;
+  config.cesComputeWorkDir      = optComputeWorkDir;
+  config.cesComputeUser         = optComputeUser;
+  config.cesComputeChildBinary  = optComputeChildBinary;
+  // Auto-discover cesluajitd next to our own binary if the operator
+  // didn't specify a path. Typical install (build dir or /opt/ces/)
+  // has ces and cesluajitd as siblings, so no toml line is needed.
+  // Falls back to bare "cesluajitd" (PATH lookup) if discovery fails.
+  if (config.cesComputeChildBinary.empty()) {
+    char exePath[4096];
+    ssize_t n = ::readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (n > 0) {
+      exePath[n] = '\0';
+      auto candidate =
+        std::filesystem::path(exePath).parent_path() / "cesluajitd";
+      std::error_code ec;
+      if (std::filesystem::exists(candidate, ec)) {
+        config.cesComputeChildBinary = candidate.string();
+        LOGINFO << "compute: auto-discovered cesluajitd next to ces"
+                << SVAR(config.cesComputeChildBinary);
+      }
+    }
+    if (config.cesComputeChildBinary.empty()) {
+      config.cesComputeChildBinary = "cesluajitd";  // PATH fallback
+    }
+  }
+
+  // /s/ extensions. Dedup via std::set semantics.
+  for (const auto& n : optExtensions) {
+    if (!n.empty()) config.extensions.insert(n);
+  }
+
+  // CesPlex mounts: parse "proto=target" entries, skip malformed ones
+  // with a warning (rather than exit — a typo shouldn't kill the whole
+  // server if other mounts are fine).
+  for (const auto& m : optCesplexMounts) {
+    auto eq = m.find('=');
+    if (eq == std::string::npos || eq == 0 || eq == m.size() - 1) {
+      std::cerr << "WARN: ignoring malformed cesplex mount: " << m
+                << " (expected proto=target)\n";
+      continue;
+    }
+    config.cesplexMounts[m.substr(0, eq)] = m.substr(eq + 1);
+  }
+
+  LOGINFO << "ces config"
+          << VAR(optServerPort) << VAR(config.dataDir)
+          << VAR(config.minAcc) << VAR(config.maxAcc)
+          << VAR(config.minDiff) << VAR(config.minProveWorkTimestamp)
+          << VAR(config.spendSlotSize) << VAR(config.taskThreads)
+          << VAR(config.feeAccount) << VAR(config.feeAsset)
+          << VAR(config.feeTx) << VAR(config.feeQuery) << VAR(config.feeVmMult)
+          << VAR(config.minAsset) << VAR(config.maxAsset)
+          << VAR(config.flushValue) << VAR(config.maxLogBytes)
+          << VAR(config.serverName) << VAR(config.peerTarget)
+          << VAR(config.peerPowInboundReciprocationBps)
+          << VAR(config.settlementMaxRetries)
+          << VAR(config.rpcPort)
+          << VAR(config.cesFileStoreMaxBytes)
+          << VAR(optNoPowEngine);
+  for (auto& p : optPeers) {
+    auto at = p.find('@');
+    if (at == std::string::npos) continue; // already validated above
+    CesConfig::PeerConfig pc;
+    pc.pubKeyHex = p.substr(0, at);
+    pc.address = p.substr(at + 1);
+    config.peers.push_back(pc);
+  }
+
+  if (!config.peers.empty()) {
+    LOGINFO << "ces peers configured: " << config.peers.size()
+            << " target=" << config.peerTarget;
+    for (size_t i = 0; i < config.peers.size(); ++i)
+      LOGINFO << "  peer " << i << ": " << config.peers[i].address
+              << " key=" << config.peers[i].pubKeyHex.substr(0, 16) << "...";
+  }
+
+  auto server = std::make_unique<CesServer>(config);
+
+  // -- Handle credit/debit commands (no networking needed) --
+  if (cmd_credit->parsed() || cmd_debit->parsed()) {
+    if (cmd_credit->parsed()) {
+      if (optCreditAmount <= 0) {
+        std::cerr << "Error: amount must be a positive number.\n";
+        return 1;
+      }
+      minx::Hash key;
+      minx::stringToHash(key, optCreditAccount);
+      server->_brr(key, optCreditAmount);
+      LOGINFO << "credited " << optCreditAmount << " to " << optCreditAccount;
+      std::cout << "Credited " << optCreditAmount << " to "
+                << optCreditAccount << "\n";
+    } else {
+      if (optDebitAmount <= 0) {
+        std::cerr << "Error: amount must be a positive number.\n";
+        return 1;
+      }
+      minx::Hash key;
+      minx::stringToHash(key, optDebitAccount);
+      server->_burn(key, optDebitAmount);
+      LOGINFO << "debited " << optDebitAmount << " from " << optDebitAccount;
+      std::cout << "Debited " << optDebitAmount << " from "
+                << optDebitAccount << "\n";
+    }
+
+    server->_save();
+    server.reset();
+    return 0;
+  }
+
+  // -- Handle snapshot command (no networking needed) --
+  if (cmd_snapshot->parsed()) {
+    LOGINFO << "writing snapshot...";
+    server->_save();
+    LOGINFO << "snapshot complete";
+    std::cout << "Snapshot written.\n";
+    server.reset();
+    return 0;
+  }
+
+  LOGINFO << "ces starting server";
+
+  uint16_t boundPort = server->start(optServerPort);
+  if (boundPort == 0) {
+    LOGERROR << "ces failed to bind the server port; aborting"
+             << VAR(optServerPort);
+    server.reset();
+    return 1;
+  }
+
+  if (optNoPowEngine) {
+    LOGINFO << "ces will not create the PoW engine";
+  } else {
+    LOGINFO << "ces creating pow engine" << VAR(optCacheOnlyPoWEngine);
+    server->createPoWEngine(!optCacheOnlyPoWEngine);
+  }
+
+  if (!optNoPowEngine) {
+    LOGINFO << "ces waiting for PoW engine to be ready (press Ctrl+C to stop)";
+    int c = 0;
+    while (ces::notInterrupted()) {
+      ces::sleep(100);
+      if (server->isPoWEngineReady()) {
+        LOGINFO << "ces pow engine ready";
+        break;
+      }
+      if (++c >= 50) {
+        c = 0;
+        LOGTRACE << "ces waiting for PoW engine to be ready...";
+      }
+    }
+  }
+
+  // Start peer miner (if peers configured and target > 0)
+  server->startPeerMiner();
+
+  // Start admin console (Cesco) if configured
+  boost::asio::io_context cescoIO;
+  std::unique_ptr<ces::Cesco> cesco;
+  std::thread cescoThread;
+  if (!config.adminSocket.empty()) {
+    cesco = std::make_unique<ces::Cesco>(cescoIO, *server);
+    if (cesco->listen(config.adminSocket)) {
+      cescoThread = std::thread(
+        [&cescoIO]() { ces::runGuardedThread([&cescoIO]{ cescoIO.run(); }, "cescoIO"); });
+    } else {
+      cesco.reset();
+    }
+  }
+
+  // Start web dashboard if configured. Loopback only, no auth — reach it
+  // over an SSH tunnel. Runs on its own io_context, like Cesco.
+  boost::asio::io_context webIO;
+  std::unique_ptr<ces::WebAdmin> webadmin;
+  std::vector<std::thread> webThreads;
+  if (config.webPort != 0) {
+    webadmin = std::make_unique<ces::WebAdmin>(webIO, *server);
+    if (webadmin->listen(config.webBind, config.webPort, config.webAllowPublic)) {
+      // A small pool, not one thread: the dashboard's ledger reads block the
+      // serving thread on a logicStrand_ hop, and a browser polls several
+      // endpoints concurrently — a single thread stalls (dashboard "flicker")
+      // whenever one read waits on a busy strand (e.g. a server being mined
+      // on). The handlers are thread-safe (strand hops / mutexes / atomics),
+      // so serving them across a few threads is safe.
+      for (int i = 0; i < 4; ++i)
+        webThreads.emplace_back(
+          [&webIO]() { ces::runGuardedThread([&webIO]{ webIO.run(); }, "webIO"); });
+    } else {
+      webadmin.reset();
+    }
+  }
+
+  LOGINFO << "ces running server" << VAR(boundPort)
+          << "(press Ctrl+C to stop)";
+
+  while (ces::notInterrupted()) {
+    ces::sleep(100);
+  }
+
+  LOGINFO << "ces stopping server";
+  if (webadmin) {
+    webadmin->stop();
+    webIO.stop();
+    for (auto& t : webThreads)
+      if (t.joinable())
+        t.join();
+    webadmin.reset();
+  }
+  if (cesco) {
+    cesco->stop();
+    cescoIO.stop();
+    if (cescoThread.joinable())
+      cescoThread.join();
+    cesco.reset();
+  }
+  server->stop();
+  LOGINFO << "ces destroying server";
+  server.reset();
+  LOGINFO << "ces exit";
+  return 0;
+}

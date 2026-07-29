@@ -23,14 +23,25 @@ set(LITEHTML_ENABLE_LINT OFF CACHE BOOL "" FORCE)
 set(LITEHTML_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(litehtml)
 
-# Pinned CES: fetch the client engine (ceslib) from the ces remote at a fixed
-# commit -- never the local working tree. MakeAvailable also exposes the ces
-# server and cesluajitd as build targets, so the local demo runs on the same pin.
+# Vendored CES snapshot (vendor/ces): the client engine cwb links. Only ceslib
+# and its deps build (EXCLUDE_FROM_ALL); the ces tools are opt-in below. A
+# developer can still point at a live checkout with
+# -DFETCHCONTENT_SOURCE_DIR_CES=<path> (build.sh CES_SRC).
 FetchContent_Declare(ces
-  GIT_REPOSITORY https://github.com/fcecin/ces
-  GIT_TAG        1b8bf36)
+  SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/ces
+  EXCLUDE_FROM_ALL)
 set(CES_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ces)
+
+# The local demo loop wants the ces server + cesh on the side; CI does not.
+option(CWB_BUILD_CES_TOOLS "Also build the ces server and cesh" ON)
+if(CWB_BUILD_CES_TOOLS)
+  foreach(t ces cesh cesluajitd)
+    if(TARGET ${t})
+      set_target_properties(${t} PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    endif()
+  endforeach()
+endif()
 
 # md4c: a small, fast, MIT-licensed Markdown parser (GFM tables/tasklists). Its
 # md4c-html target renders Markdown straight to an HTML fragment that litehtml

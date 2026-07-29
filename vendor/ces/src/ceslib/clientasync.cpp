@@ -1,0 +1,402 @@
+#include <ces/clientasync.h>
+#include <minx/blog.h>
+#include <minx/minx.h>
+
+namespace ces {
+
+CesClientAsync::CesClientAsync(boost::asio::io_context& io,
+                               const boost::asio::ip::udp::endpoint& serverEndpoint,
+                               const KeyPair& keyPair,
+                               const Hash& peerServerKey,
+                               size_t numChannels,
+                               int maxRetries)
+    : io_(io), socket_(io, boost::asio::ip::udp::v6()),
+      serverEp_(serverEndpoint), sweepTimer_(io), keyPair_(keyPair),
+      peerServerKey_(peerServerKey), maxRetries_(maxRetries) {
+  boost::system::error_code ec;
+  socket_.set_option(boost::asio::ip::v6_only(false), ec);
+  // The socket is v6 dual-stack; a plain-IPv4 destination endpoint can't be sent
+  // on it (the AF_INET sockaddr is rejected). Normalize a v4 endpoint to
+  // v4-mapped-v6 (::ffff:a.b.c.d) so a peer whose address resolves to plain IPv4
+  // — a v4 literal or a v4-first DNS result — is actually reachable. The CesPlex
+  // session path already does this; settlement was the outbound path missing it.
+  if (serverEp_.address().is_v4())
+    serverEp_ = boost::asio::ip::udp::endpoint(
+      boost::asio::ip::make_address_v6(boost::asio::ip::v4_mapped,
+                                       serverEp_.address().to_v4()),
+      serverEp_.port());
+  channels_.resize(numChannels);
+  LOGDEBUG << "CesClientAsync: " << numChannels << " channels to " << serverEp_;
+  startReceive();
+}
+
+CesClientAsync::~CesClientAsync() { close(); }
+
+void CesClientAsync::close() {
+  if (closed_) return;
+  closed_ = true;
+  { boost::system::error_code ec; sweepTimer_.cancel(ec); }
+  { boost::system::error_code ec; socket_.close(ec); }
+  failAll(CES_ERROR_INTERNAL);
+}
+
+// ---- Public API ----
+
+void CesClientAsync::openTransfer(const Hash& destKey, uint64_t amount, Callback cb) {
+  boost::asio::post(io_, [this, destKey, amount, cb = std::move(cb)]() mutable {
+    if (closed_) { cb(CES_ERROR_INTERNAL); return; }
+    if (queue_.size() >= MAX_QUEUE) { cb(CES_ERROR_QUEUE_FULL); return; }
+    ++pendingCount_;
+
+    QueuedOp op;
+    op.destKey = destKey;
+    op.amount = amount;
+    op.cb = std::move(cb);
+    // Give up after the receiver's dedup window: past it, a retry is rejected
+    // stale anyway, so retrying is pointless. A bounded sender-side deadline also
+    // covers a half-up peer (answers handshakes, never replies to the op). Giving
+    // up is conserved -- the amount stays parked in the vostro, no reversal.
+    op.deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(SETTLEMENT_DEADLINE_MS);
+
+    CesOpenTransfer msg;
+    msg.originId = keyPair_.getPublicKeyAsHash();
+    msg.serverId = Account::getMapKey(peerServerKey_);
+    msg.reqNonce = CES_NONCELESS;
+    msg.destKey = destKey;
+    msg.amount = amount;
+    msg.time = ces::getMicrosSinceEpoch();
+    op.signedPayload = msg.toBytes(keyPair_);
+
+    queue_.push_back(std::move(op));
+    dispatch();
+  });
+}
+
+void CesClientAsync::gossip(const Hash& authorId, const Hash& msgId,
+                            const Hash& dest, uint64_t budget,
+                            const ces::Bytes& msg, GossipCallback cb) {
+  boost::asio::post(io_, [this, authorId, msgId, dest, budget, msg,
+                          cb = std::move(cb)]() mutable {
+    if (closed_) { cb(CES_ERROR_INTERNAL, 0); return; }
+    if (queue_.size() >= MAX_QUEUE) { cb(CES_ERROR_QUEUE_FULL, 0); return; }
+    // Gossip yields to settlement: ride this client only when nothing is backed
+    // up waiting for a channel. Any settlement backlog rules gossip off this peer
+    // (best-effort burn, paid 0) so cross-transfers own the channels. In-flight
+    // ops do not count: a saturated but not overflowing client still carries
+    // gossip; the first op that cannot get a channel shuts gossip out.
+    if (!queue_.empty()) {
+      cb(CES_ERROR_QUEUE_FULL, 0);
+      return;
+    }
+    ++pendingCount_;
+
+    QueuedOp op;
+    op.kind = OpKind::Gossip;
+    op.gcb = std::move(cb);
+    op.deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(GOSSIP_DEADLINE_MS);
+
+    CesGossip m;
+    m.originId = keyPair_.getPublicKeyAsHash();
+    m.serverId = Account::getMapKey(peerServerKey_);
+    m.reqNonce = CES_NONCELESS;
+    m.authorId = authorId;
+    m.msgId = msgId;
+    m.dest = dest;
+    m.budget = budget;
+    m.time = ces::getMicrosSinceEpoch();
+    m.msg = msg;
+    op.signedPayload = m.toBytes(keyPair_);
+
+    queue_.push_back(std::move(op));
+    dispatch();
+  });
+}
+
+// ---- Dispatch ----
+
+void CesClientAsync::dispatch() {
+  if (closed_ || queue_.empty()) return;
+
+  for (auto& ch : channels_) {
+    if (queue_.empty()) break;
+    if (ch.state == ChState::Idle) {
+      handshake(ch);
+    } else if (ch.state == ChState::Ready) {
+      ch.currentOp = std::move(queue_.front());
+      queue_.pop_front();
+      sendOp(ch);
+    }
+  }
+
+  if (!queue_.empty())
+    startSweepTimer();
+}
+
+// ---- Channel operations ----
+
+void CesClientAsync::handshake(Channel& ch) {
+  ch.state = ChState::Handshaking;
+  ch.sentGPass = genPassword();
+  ch.retries = 0;
+  ch.sentAt = std::chrono::steady_clock::now();
+  sendGetInfo(ch);
+  startSweepTimer();
+}
+
+void CesClientAsync::sendGetInfo(Channel& ch) {
+  minx::ArrayBuffer<64> buf;
+  buf.put<uint8_t>(minx::MINX_GET_INFO);
+  buf.put<uint8_t>(0);
+  buf.put(ch.sentGPass);
+  sendBuf(buf);
+}
+
+void CesClientAsync::sendOp(Channel& ch) {
+  ch.state = ChState::Busy;
+  ch.sentGPass = genPassword();
+  ch.retries = 0;
+  ch.sentAt = std::chrono::steady_clock::now();
+
+  minx::ArrayBuffer<512> buf;
+  buf.put<uint8_t>(minx::MINX_MESSAGE);
+  buf.put<uint8_t>(0);
+  buf.put(ch.sentGPass);
+  buf.put(ch.ticket);
+  ch.ticket = 0;
+  auto& payload = ch.currentOp.signedPayload;
+  buf.put(std::span<const uint8_t>(
+    reinterpret_cast<const uint8_t*>(payload.data()), payload.size()));
+  sendBuf(buf);
+
+  startSweepTimer();
+}
+
+// ---- Receive ----
+
+void CesClientAsync::startReceive() {
+  if (closed_) return;
+  socket_.async_receive_from(
+    boost::asio::buffer(recvBuf_), recvEp_,
+    [this](const boost::system::error_code& ec, size_t bytes) {
+      onReceive(ec, bytes);
+    });
+}
+
+void CesClientAsync::onReceive(const boost::system::error_code& ec, size_t bytes) {
+  if (ec || closed_) return;
+  // A malformed/truncated reply must not throw out of here (a fromBytes parse can
+  // throw): that would skip startReceive() and leave the client permanently deaf
+  // to this peer. Drop the bad datagram, keep the receive loop alive.
+  try {
+    if (bytes >= 1) {
+      switch (recvBuf_[0]) {
+      case minx::MINX_INFO:    handleInfo(recvBuf_.data(), bytes); break;
+      case minx::MINX_MESSAGE: handleMessage(recvBuf_.data(), bytes); break;
+      default: break;
+      }
+    }
+  } catch (const std::exception&) {
+    // Bad packet from the peer; ignore it.
+  }
+  startReceive();
+}
+
+// MINX envelope preamble on the wire: code + version + gpassword + spassword.
+// `parseMinxEnvelope` advances the buffer past these fields. INFO additionally
+// carries a 32-byte server key and a 1-byte difficulty; MESSAGE carries at
+// least one CES opcode byte of payload after the envelope.
+static constexpr size_t MINX_ENVELOPE_BYTES =
+  sizeof(uint8_t)              // code
+  + sizeof(uint8_t)            // version
+  + sizeof(uint64_t)           // gpassword
+  + sizeof(uint64_t);          // spassword
+
+static void parseMinxEnvelope(minx::ConstBuffer& buf,
+                              uint64_t& gpass, uint64_t& spass) {
+  buf.get<uint8_t>();  // code
+  buf.get<uint8_t>();  // version
+  gpass = buf.get<uint64_t>();
+  spass = buf.get<uint64_t>();
+}
+
+void CesClientAsync::handleInfo(const uint8_t* data, size_t len) {
+  constexpr size_t MIN =
+    MINX_ENVELOPE_BYTES
+    + sizeof(minx::Hash)       // skey
+    + sizeof(uint8_t);         // difficulty
+  if (len < MIN) return;
+
+  minx::ConstBuffer buf(std::span<const uint8_t>(data, len));
+  uint64_t gpass, spass;
+  parseMinxEnvelope(buf, gpass, spass);
+  minx::Hash skey = buf.get<minx::Hash>();
+
+  for (auto& ch : channels_) {
+    if (ch.state == ChState::Handshaking && ch.sentGPass == spass) {
+      ch.ticket = gpass;
+      ch.serverKey = skey;
+      ch.state = ChState::Ready;
+      dispatch();
+      return;
+    }
+  }
+}
+
+void CesClientAsync::handleMessage(const uint8_t* data, size_t len) {
+  constexpr size_t MIN =
+    MINX_ENVELOPE_BYTES
+    + sizeof(uint8_t);         // first CES opcode byte
+  if (len < MIN) return;
+
+  minx::ConstBuffer buf(std::span<const uint8_t>(data, len));
+  uint64_t gpass, spass;
+  parseMinxEnvelope(buf, gpass, spass);
+
+  auto cesData = buf.getRemainingBytesSpan();
+  if (cesData.empty()) return;
+  uint8_t opcode = cesData[0];
+  if (opcode != CES_OPEN_TRANSFER_RESULT && opcode != CES_GOSSIP_RESULT) return;
+
+  for (auto& ch : channels_) {
+    if (ch.state != ChState::Busy || ch.sentGPass != spass) continue;
+
+    PublicKey verifier(ch.serverKey);
+    minx::Bytes cesBytes(cesData.begin(), cesData.end());
+    uint8_t rcode = CES_ERROR_INTERNAL;
+    uint64_t paid = 0;
+
+    if (opcode == CES_OPEN_TRANSFER_RESULT &&
+        ch.currentOp.kind == OpKind::OpenTransfer) {
+      CesOpenTransferResult res;
+      if (!res.fromBytes(cesBytes, verifier)) {
+        LOGDEBUG << "CesClientAsync: ch" << chIdx(ch) << " sig verify failed";
+        return;
+      }
+      rcode = res.rcode;
+    } else if (opcode == CES_GOSSIP_RESULT &&
+               ch.currentOp.kind == OpKind::Gossip) {
+      CesGossipResult res;
+      if (!res.fromBytes(cesBytes, verifier)) {
+        LOGDEBUG << "CesClientAsync: ch" << chIdx(ch) << " sig verify failed";
+        return;
+      }
+      rcode = res.rcode;
+      paid = res.paid;
+    } else {
+      return;  // response opcode does not match the in-flight op kind
+    }
+
+    ch.ticket = gpass;
+    ch.state = ChState::Ready;
+    --pendingCount_;
+    QueuedOp done = std::move(ch.currentOp);
+    ch.currentOp = {};
+    fireOpCallback(done, rcode, paid);
+    dispatch();
+    return;
+  }
+}
+
+// ---- Sweep ----
+
+void CesClientAsync::sweep() {
+  if (closed_) return;
+
+  auto now = std::chrono::steady_clock::now();
+  bool anyActive = false;
+
+  for (auto& ch : channels_) {
+    if (ch.state == ChState::Handshaking) {
+      anyActive = true;
+      if (now - ch.sentAt <= std::chrono::milliseconds(HANDSHAKE_RETRY_MS))
+        continue;
+      if (++ch.retries >= maxRetries_) {
+        ch.state = ChState::Idle;
+      } else {
+        ch.sentGPass = genPassword();
+        ch.sentAt = now;
+        sendGetInfo(ch);
+      }
+    }
+
+    else if (ch.state == ChState::Busy) {
+      anyActive = true;
+      bool isGossip = ch.currentOp.kind == OpKind::Gossip;
+      // Give the op up at its deadline (gossip ~5s, settlement ~1h); unset
+      // deadline (epoch) means retry within reachability indefinitely.
+      if (ch.currentOp.deadline != std::chrono::steady_clock::time_point{} &&
+          now >= ch.currentOp.deadline) {
+        --pendingCount_;
+        QueuedOp done = std::move(ch.currentOp);
+        ch.currentOp = {};
+        ch.state = ChState::Idle;
+        fireOpCallback(done, CES_ERROR_TIMEOUT, 0);
+        continue;
+      }
+      int retryMs = isGossip ? GOSSIP_RETRY_MS : RETRY_MS;
+      if (now - ch.sentAt <= std::chrono::milliseconds(retryMs))
+        continue;
+      if (++ch.retries >= maxRetries_) {
+        --pendingCount_;
+        QueuedOp done = std::move(ch.currentOp);
+        ch.currentOp = {};
+        ch.state = ChState::Idle;
+        fireOpCallback(done, CES_ERROR_TIMEOUT, 0);
+      } else {
+        queue_.push_front(std::move(ch.currentOp));
+        ch.currentOp = {};
+        handshake(ch);
+      }
+    }
+  }
+
+  dispatch();
+
+  if (anyActive || !queue_.empty())
+    startSweepTimer();
+}
+
+void CesClientAsync::startSweepTimer() {
+  sweepTimer_.expires_after(std::chrono::seconds(1));
+  sweepTimer_.async_wait([this](const boost::system::error_code& ec) {
+    if (ec || closed_) return;
+    sweep();
+  });
+}
+
+// ---- Cleanup ----
+
+void CesClientAsync::failAll(uint8_t rc) {
+  for (auto& ch : channels_) {
+    if (ch.state == ChState::Busy)
+      fireOpCallback(ch.currentOp, rc, 0);
+    ch.state = ChState::Idle;
+    ch.currentOp = {};
+  }
+  while (!queue_.empty()) {
+    fireOpCallback(queue_.front(), rc, 0);
+    queue_.pop_front();
+  }
+  pendingCount_.store(0, std::memory_order_relaxed);
+}
+
+// ---- Helpers ----
+
+uint64_t CesClientAsync::genPassword() { return rngDist_(rng_); }
+
+template <size_t N>
+void CesClientAsync::sendBuf(minx::ArrayBuffer<N>& buf) {
+  // Copy the framed bytes into a heap buffer owned by the completion handler.
+  // async_send_to references the storage until the send completes, but `buf`
+  // is a stack local in the caller and would be destroyed before then.
+  auto span = buf.getBackingSpan();
+  auto data = std::make_shared<ces::Bytes>(span.data(),
+                                           span.data() + buf.getSize());
+  socket_.async_send_to(
+    boost::asio::buffer(*data), serverEp_,
+    [data](const boost::system::error_code&, size_t) {});
+}
+
+} // namespace ces
