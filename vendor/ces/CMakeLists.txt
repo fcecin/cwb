@@ -9,9 +9,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # 1. EXPLICIT COMPILER CONFIGURATION
 # -----------------------------------------------------------------------------
 
-# Apply hardware optimizations globally to all C and C++ targets
+# Apply hardware optimizations globally to all C and C++ targets (x86 only;
+# e.g. Apple Silicon rejects x86-64-v3).
 set(CES_MARCH "x86-64-v3" CACHE STRING "Target -march; 'native' = local-only")
-add_compile_options(-march=${CES_MARCH})
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  add_compile_options(-march=${CES_MARCH})
+endif()
 
 # Force -O3 for pure Release builds (Overrides secp256k1's -O2 fallback)
 add_compile_options("$<$<CONFIG:Release>:-O3>")
@@ -155,6 +158,31 @@ endif()
 # Recursive so ceslib's source tree mirrors the include tree: every
 # include/ces/<group>/<name>.h has its src/ceslib/<group>/<name>.cpp.
 file(GLOB_RECURSE CESLIB_SOURCES "src/ceslib/*.cpp")
+
+# The portable client subset: keys/protocol/client, CesPlexClient, the L2
+# file/compute clients, and utils. The server half (ledger tables, VM, L2
+# handlers, CesPlex bus, webadmin) is POSIX and stays off non-POSIX hosts.
+# A pure client (cwb) links the same subset everywhere.
+if(WIN32)
+  set(CES_CLIENT_ONLY_DEFAULT ON)
+else()
+  set(CES_CLIENT_ONLY_DEFAULT OFF)
+endif()
+option(CES_CLIENT_ONLY "ceslib = client-side engine only"
+       ${CES_CLIENT_ONLY_DEFAULT})
+if(CES_CLIENT_ONLY)
+  list(FILTER CESLIB_SOURCES EXCLUDE REGEX
+       "src/ceslib/(server|webadmin|extension_manager|cesco|clientasync|ramfilestore|cesvm|accounts|aliases|assets|keynames)\\.cpp$")
+  list(FILTER CESLIB_SOURCES EXCLUDE REGEX
+       "src/ceslib/l2/.*(handler|site)\\.cpp$")
+  list(FILTER CESLIB_SOURCES EXCLUDE REGEX
+       "src/ceslib/cesplex/(mux|meter|endpoint)\\.cpp$")
+  list(FILTER CESLIB_SOURCES EXCLUDE REGEX
+       "src/ceslib/(lang/.*|util/(smtp|vmprogram|kvcount))\\.cpp$")
+else()
+  list(FILTER CESLIB_SOURCES EXCLUDE REGEX
+       "src/ceslib/client_only_compat\\.cpp$")
+endif()
 add_library(ceslib STATIC ${CESLIB_SOURCES})
 
 target_compile_definitions(ceslib PUBLIC BOOST_ASIO_HEADER_ONLY)
