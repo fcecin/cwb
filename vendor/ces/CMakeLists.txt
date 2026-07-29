@@ -233,6 +233,9 @@ if(NOT GIT_COMMIT_DATE)
   set(GIT_COMMIT_DATE "unknown")
 endif()
 
+# Every executable needs the full ceslib; a client-only build ships only the
+# library for a downstream (e.g. cwb) to link.
+if(NOT CES_CLIENT_ONLY)
 file(GLOB CES_CPP "src/ces/*.cpp")
 add_executable(ces ${CES_CPP})
 target_link_libraries(ces PRIVATE ceslib CLI11::CLI11)
@@ -273,6 +276,8 @@ add_executable(cescompmockd src/cescompmockd/main.cpp)
 target_link_options(cescompmockd PRIVATE "-Wl,-z,noexecstack")
 set_target_properties(cescompmockd PROPERTIES OUTPUT_NAME "cescompmockd")
 
+# The compute child; also the only LuaJIT consumer, so the pkg-config
+# requirement lives with it.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LUAJIT REQUIRED luajit)
 add_executable(cesluajitd
@@ -284,6 +289,7 @@ target_link_libraries(cesluajitd PRIVATE ${LUAJIT_LIBRARIES} ceslib)
 target_link_directories(cesluajitd PRIVATE ${LUAJIT_LIBRARY_DIRS})
 target_link_options(cesluajitd PRIVATE "-Wl,-z,noexecstack")
 set_target_properties(cesluajitd PROPERTIES OUTPUT_NAME "cesluajitd")
+endif()  # NOT CES_CLIENT_ONLY: tools, cesluajitd, and LuaJIT all skipped
 
 # -----------------------------------------------------------------------------
 # 6. OPTIONAL: the hyle consensus engine (core + services) for cesluajitd
@@ -296,7 +302,7 @@ set_target_properties(cesluajitd PROPERTIES OUTPUT_NAME "cesluajitd")
 # PUBLIC-links core), so the C++ side can drive a blockchain node over its own
 # transport. Wired now; unused (no #include) until cesluajitd starts using it.
 option(CES_HYLE "Fetch + link the hyle consensus engine (core + services) into cesluajitd" OFF)
-if(CES_HYLE)
+if(CES_HYLE AND NOT CES_CLIENT_ONLY)
   FetchContent_Declare(
     hyle
     GIT_REPOSITORY https://github.com/fcecin/hyle.git
@@ -316,7 +322,7 @@ endif()
 # Outbound mail: builtin:mail + the SMTP/TLS client. Off by default; build.sh
 # --mail. Needs system OpenSSL.
 option(CES_MAIL "Enable outbound mail (builtin:mail + SMTP with TLS)" OFF)
-if(CES_MAIL)
+if(CES_MAIL AND NOT CES_CLIENT_ONLY)
   find_package(OpenSSL REQUIRED)
   target_link_libraries(ceslib PUBLIC OpenSSL::SSL OpenSSL::Crypto)
   target_compile_definitions(ceslib PUBLIC CES_MAIL=1)
@@ -326,7 +332,7 @@ endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/QtDiscovery.cmake)
 find_package(Qt6 QUIET COMPONENTS Widgets Network)
-if(Qt6_FOUND)
+if(Qt6_FOUND AND NOT CES_CLIENT_ONLY)
   set(CMAKE_AUTOMOC ON)
   add_executable(cesqt
     src/cesqt/main.cpp
@@ -348,7 +354,7 @@ else()
 endif()
 
 option(CES_BUILD_TESTS "Build unit tests" ON)
-if(CES_BUILD_TESTS)
+if(CES_BUILD_TESTS AND NOT CES_CLIENT_ONLY)
   enable_testing()
   add_subdirectory(tests)
 endif()
