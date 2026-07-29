@@ -38,7 +38,14 @@ if(POLICY CMP0167)
   cmake_policy(SET CMP0167 NEW)
 endif()
 set(Boost_USE_STATIC_LIBS ON)
-find_package(Boost 1.83.0 REQUIRED COMPONENTS system log log_setup stacktrace_addr2line)
+# Boost.System is header-only since 1.69 and its component config vanished in
+# 1.90, so never request it. The addr2line stacktrace backend (plus
+# libbacktrace below) is a Linux nicety; other platforms get a plain handler.
+set(CES_BOOST_COMPONENTS log log_setup)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND CES_BOOST_COMPONENTS stacktrace_addr2line)
+endif()
+find_package(Boost 1.83.0 REQUIRED COMPONENTS ${CES_BOOST_COMPONENTS})
 
 # -----------------------------------------------------------------------------
 # 3. FETCH CONTENT DEPENDENCIES
@@ -107,29 +114,37 @@ FetchContent_MakeAvailable(mene)
 
 include(ExternalProject)
 
-set(LIBBACKTRACE_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/libbacktrace_install)
-set(LIBBACKTRACE_INCLUDE_DIR ${LIBBACKTRACE_PREFIX}/include)
-set(LIBBACKTRACE_LIB ${LIBBACKTRACE_PREFIX}/lib/libbacktrace.a)
+# Linux-only (see the Boost components note above). BYPRODUCTS is required
+# for Ninja to know the imported .a comes from the external project.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(LIBBACKTRACE_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/libbacktrace_install)
+  set(LIBBACKTRACE_INCLUDE_DIR ${LIBBACKTRACE_PREFIX}/include)
+  set(LIBBACKTRACE_LIB ${LIBBACKTRACE_PREFIX}/lib/libbacktrace.a)
 
-ExternalProject_Add(libbacktrace_ext
-    GIT_REPOSITORY    https://github.com/ianlancetaylor/libbacktrace.git
-    GIT_TAG           master
-    PREFIX            ${LIBBACKTRACE_PREFIX}
-    CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=${LIBBACKTRACE_PREFIX} --enable-shared=OFF --enable-static=ON --with-pic
-    BUILD_COMMAND     make
-    INSTALL_COMMAND   make install
-    UPDATE_COMMAND    ""
-    LOG_DOWNLOAD ON LOG_CONFIGURE ON LOG_BUILD ON
-)
+  ExternalProject_Add(libbacktrace_ext
+      GIT_REPOSITORY    https://github.com/ianlancetaylor/libbacktrace.git
+      GIT_TAG           master
+      PREFIX            ${LIBBACKTRACE_PREFIX}
+      CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=${LIBBACKTRACE_PREFIX} --enable-shared=OFF --enable-static=ON --with-pic
+      BUILD_COMMAND     make
+      INSTALL_COMMAND   make install
+      UPDATE_COMMAND    ""
+      BUILD_BYPRODUCTS  ${LIBBACKTRACE_LIB}
+      LOG_DOWNLOAD ON LOG_CONFIGURE ON LOG_BUILD ON
+  )
 
-file(MAKE_DIRECTORY ${LIBBACKTRACE_INCLUDE_DIR})
+  file(MAKE_DIRECTORY ${LIBBACKTRACE_INCLUDE_DIR})
 
-add_library(libbacktrace STATIC IMPORTED GLOBAL)
-add_dependencies(libbacktrace libbacktrace_ext)
-set_target_properties(libbacktrace PROPERTIES
-    IMPORTED_LOCATION "${LIBBACKTRACE_LIB}"
-    INTERFACE_INCLUDE_DIRECTORIES "${LIBBACKTRACE_INCLUDE_DIR}"
-)
+  add_library(libbacktrace STATIC IMPORTED GLOBAL)
+  add_dependencies(libbacktrace libbacktrace_ext)
+  set_target_properties(libbacktrace PROPERTIES
+      IMPORTED_LOCATION "${LIBBACKTRACE_LIB}"
+      INTERFACE_INCLUDE_DIRECTORIES "${LIBBACKTRACE_INCLUDE_DIR}"
+  )
+  set(CES_STACKTRACE_LIBS Boost::stacktrace_addr2line libbacktrace)
+else()
+  set(CES_STACKTRACE_LIBS "")
+endif()
 
 # -----------------------------------------------------------------------------
 # 5. TARGETS
@@ -140,7 +155,11 @@ set_target_properties(libbacktrace PROPERTIES
 file(GLOB_RECURSE CESLIB_SOURCES "src/ceslib/*.cpp")
 add_library(ceslib STATIC ${CESLIB_SOURCES})
 
-target_compile_definitions(ceslib PUBLIC BOOST_ASIO_HEADER_ONLY BOOST_STACKTRACE_USE_BACKTRACE)
+target_compile_definitions(ceslib PUBLIC BOOST_ASIO_HEADER_ONLY)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_compile_definitions(ceslib PUBLIC BOOST_STACKTRACE_USE_BACKTRACE
+                                           CES_HAVE_STACKTRACE)
+endif()
 
 target_compile_options(ceslib PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -154,13 +173,12 @@ PUBLIC
 target_link_libraries(ceslib
 PUBLIC
   ${Boost_LIBRARIES}
-  Boost::stacktrace_addr2line
+  ${CES_STACKTRACE_LIBS}
   cryptopp::cryptopp
   secp256k1
   minxlib
   mene::assets
   Threads::Threads
-  libbacktrace
   ${CMAKE_DL_LIBS}
   tomlplusplus::tomlplusplus
 )
