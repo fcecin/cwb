@@ -28,7 +28,7 @@ FetchContent_MakeAvailable(litehtml)
 # server and cesluajitd as build targets, so the local demo runs on the same pin.
 FetchContent_Declare(ces
   GIT_REPOSITORY https://github.com/fcecin/ces
-  GIT_TAG        1b8bf36)
+  GIT_TAG        aaaa1a4)
 set(CES_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ces)
 
