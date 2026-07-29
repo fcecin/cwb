@@ -37,17 +37,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: System deps
-        run: brew install ninja pkg-config boost luajit
-      - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: '6.8.*'
-          modules: 'qtmultimedia'
-          cache: true
+        # Homebrew Qt: built against the runner's SDK (the aqt binaries still
+        # reference the AGL framework, removed from modern Xcode SDKs).
+        run: brew install ninja pkg-config boost luajit qt
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DCWB_BUILD_CES_TOOLS=OFF
+          -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
           -DCMAKE_EXE_LINKER_FLAGS="-L$(brew --prefix icu4c)/lib"
       - name: Build
         run: cmake --build build
