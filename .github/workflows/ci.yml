@@ -48,6 +48,7 @@ jobs:
         run: >
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DCWB_BUILD_CES_TOOLS=OFF
+          -DCMAKE_EXE_LINKER_FLAGS="-L$(brew --prefix icu4c)/lib"
       - name: Build
         run: cmake --build build
       - name: Test
