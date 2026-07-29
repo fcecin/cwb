@@ -58,19 +58,29 @@ std::string toHex(const std::array<uint8_t, 32>& a) {
   return out;
 }
 
-// Send one raw command line to the live Vellum instance. "" on transport
-// success (`resp` filled; may still be an application error string).
+// POST a body to a Vellum HTTP endpoint on the live instance (Vellum is a plain
+// web server; every action is an HTTP request). "" on transport success; `resp`
+// is the reply body ("ok"/"yes"/"no" or an application error string).
 std::string vellumCmd(const std::string& host, uint16_t rpc,
-                      const ces::KeyPair& id, const std::string& line,
-                      std::string& resp) {
+                      const ces::KeyPair& id, const std::string& path,
+                      const std::string& body, std::string& resp) {
   ces::CesComputeClient cc;
   if (cc.connect(host, rpc, id) != ces::CES_OK) return "no compute lane";
   std::vector<ces::CesComputeClient::InstanceInfo> vi;
   const uint8_t rc = cc.instances("/s/vellum.lua", vi);
   cc.disconnect();
   if (rc != ces::CES_OK || vi.empty()) return "no live Vellum here";
+  const std::string req = "POST " + path + " HTTP/1.0\r\nHost: " + host +
+                          "\r\nContent-Length: " + std::to_string(body.size()) +
+                          "\r\nConnection: close\r\n\r\n" + body;
+  std::string http;
   uint8_t as = 0;
-  return cwb::cesLuaFetch(host, rpc, vi.front().pid, id, line, resp, as);
+  const std::string err =
+      cwb::cesLuaFetch(host, rpc, vi.front().pid, id, req, http, as);
+  if (!err.empty()) return err;
+  const auto p = http.find("\r\n\r\n");
+  resp = (p == std::string::npos) ? http : http.substr(p + 4);
+  return "";
 }
 
 class StoryBar : public QWidget {
@@ -90,7 +100,6 @@ class StoryBar : public QWidget {
       host_ = ctx_->serverHost().toStdString();
       rpc_ = ctx_->serverRpcPort();
       id_ = ctx_->identity();
-      authorName_ = ctx_->authorName();
     }
     const int cut = zonePath_.lastIndexOf('/');
     slug_ = zonePath_.mid(cut + 1);
@@ -199,8 +208,7 @@ class StoryBar : public QWidget {
         }
         if (owner) {
           std::string resp;
-          if (vellumCmd(host, rpc, id, "listed|" + path + "\n", resp)
-                  .empty()) {
+          if (vellumCmd(host, rpc, id, "/listed", path, resp).empty()) {
             feed = true;
             listed = (resp.rfind("yes", 0) == 0);
           }
@@ -289,16 +297,13 @@ class StoryBar : public QWidget {
     QString t = title_.isEmpty() ? cwb::workTitle(zonePath_) : title_;
     if (t.isEmpty()) t = slug_;
     t.replace(QLatin1Char('|'), QLatin1Char(' '));
-    QString an = authorName_;
-    an.replace(QLatin1Char('|'), QLatin1Char(' '));
-    const std::string line =
-        wantListed ? "published|" + path + "|" + t.toUtf8().toStdString() +
-                         "|" + an.toUtf8().toStdString() + "\n"
-                   : "unlist|" + path + "\n";
+    const std::string endpoint = wantListed ? "/publish" : "/unlist";
+    const std::string body =
+        wantListed ? path + "|" + t.toUtf8().toStdString() : path;
     QPointer<StoryBar> self(this);
-    std::thread([self, host, rpc, id, line, wantListed]() {
+    std::thread([self, host, rpc, id, endpoint, body, wantListed]() {
       std::string resp;
-      const std::string err = vellumCmd(host, rpc, id, line, resp);
+      const std::string err = vellumCmd(host, rpc, id, endpoint, body, resp);
       const bool ok = err.empty() && resp.rfind("ok", 0) == 0;
       const QString detail = QString::fromStdString(err.empty() ? resp : err)
                                  .trimmed();
@@ -356,7 +361,7 @@ class StoryBar : public QWidget {
       try {
         if (unlistFirst) {
           std::string resp;
-          vellumCmd(host, rpc, id, "unlist|" + path + "\n", resp);
+          vellumCmd(host, rpc, id, "/unlist", path, resp);
         }
         ces::CesFileClient fc;
         uint8_t rc = fc.connect(host, rpc, id);
@@ -418,7 +423,6 @@ class StoryBar : public QWidget {
   std::string host_;
   quint16 rpc_ = 0;
   ces::KeyPair id_;
-  QString authorName_;
   QString zonePath_, product_, appHome_, appSource_, title_, slug_, address_;
   bool listed_ = false;
   bool hasFeed_ = false;

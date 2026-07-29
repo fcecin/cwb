@@ -728,10 +728,9 @@ class WriteSurface : public cwb::FullscreenWidget {
     const quint16 rpc = rpc_;
     const ces::KeyPair id = id_;
     const QString storyTitle = t;
-    const QString aname = authorName_;
     cwb::WidgetContext* ctx = ctx_;
     QPointer<WriteSurface> self(this);
-    std::thread([self, ctx, host, rpc, id, path, html, storyTitle, aname]() {
+    std::thread([self, ctx, host, rpc, id, path, html, storyTitle]() {
       QString msg;
       QString liveUrl;
       try {
@@ -791,11 +790,12 @@ class WriteSurface : public cwb::FullscreenWidget {
                       !vi.empty()) {
                     QString ttl = storyTitle;
                     ttl.replace(QLatin1Char('|'), QLatin1Char(' '));
-                    QString an = aname;
-                    an.replace(QLatin1Char('|'), QLatin1Char(' '));
+                    const std::string body =
+                        path + "|" + ttl.toUtf8().toStdString();
                     const std::string msg =
-                        "published|" + path + "|" + ttl.toUtf8().toStdString() +
-                        "|" + an.toUtf8().toStdString() + "\n";
+                        "POST /publish HTTP/1.0\r\nHost: " + host +
+                        "\r\nContent-Length: " + std::to_string(body.size()) +
+                        "\r\nConnection: close\r\n\r\n" + body;
                     std::string resp;
                     uint8_t as = 0;
                     cwb::cesLuaFetch(host, rpc, vi.front().pid, id, msg, resp,
