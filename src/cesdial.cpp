@@ -1167,7 +1167,11 @@ uint8_t cesAccountFetch(const std::string& host, uint16_t port,
       char when[40] = "";
       const std::time_t t = static_cast<std::time_t>(xt);
       std::tm tmv{};
+#ifdef _WIN32
+      gmtime_s(&tmv, &t);
+#else
       gmtime_r(&t, &tmv);
+#endif
       std::strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S UTC", &tmv);
       b << "<tr><th>at</th><td>" << when << "</td></tr>";
     }

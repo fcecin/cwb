@@ -77,7 +77,11 @@ QString todayUtc() {
   char date[20] = "";
   const std::time_t t = std::time(nullptr);
   std::tm tmv{};
+#ifdef _WIN32
+  gmtime_s(&tmv, &t);
+#else
   gmtime_r(&t, &tmv);
+#endif
   std::strftime(date, sizeof date, "%Y-%m-%d", &tmv);
   return QLatin1String(date);
 }

@@ -163,10 +163,11 @@ file(GLOB_RECURSE CESLIB_SOURCES "src/ceslib/*.cpp")
 # file/compute clients, and utils. The server half (ledger tables, VM, L2
 # handlers, CesPlex bus, webadmin) is POSIX and stays off non-POSIX hosts.
 # A pure client (cwb) links the same subset everywhere.
-if(WIN32)
-  set(CES_CLIENT_ONLY_DEFAULT ON)
-else()
+# Default: full stack on Linux (the server's home), client subset elsewhere.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(CES_CLIENT_ONLY_DEFAULT OFF)
+else()
+  set(CES_CLIENT_ONLY_DEFAULT ON)
 endif()
 option(CES_CLIENT_ONLY "ceslib = client-side engine only"
        ${CES_CLIENT_ONLY_DEFAULT})
